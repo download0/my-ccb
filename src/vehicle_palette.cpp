@@ -1,0 +1,133 @@
+#include "vehicle_palette.h"
+
+// VehiclePalette loading/lookup (see vehicle_palette.h). Each palette maps fuzzy
+// part-id prefixes to a weighted color group; fuzzy_to_index() finds a part's
+// group and pick_colors() rolls one weighted-random color per group. Colors are
+// referenced by name (resolved through RGBColor::try_parse -> named_colors.json).
+
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+#include "debug.h"
+#include "flexbuffer_json.h"
+#include "hsv_color.h"
+#include "type_id.h"
+
+// Only ever accessed from this translation unit (all lookups route through the
+// vpalette_id string_id indirection below), so keep it file-local rather than a
+// header static like CBN does.
+static std::unordered_map<vpalette_id, VehiclePalette> vehicle_color_palettes;
+
+const VehiclePalette *cata::lua_platform::detail::vehicle_color_palette_registry_find(
+    const vpalette_id &id )
+{
+    const auto iter = vehicle_color_palettes.find( id );
+    return iter == vehicle_color_palettes.end() ? nullptr : &iter->second;
+}
+
+void cata::lua_platform::detail::vehicle_color_palette_registry_set(
+    const VehiclePalette &value )
+{
+    vehicle_color_palettes[value.id] = value;
+}
+
+void cata::lua_platform::detail::vehicle_color_palette_registry_erase(
+    const vpalette_id &id )
+{
+    vehicle_color_palettes.erase( id );
+}
+
+/** @relates string_id */
+template<>
+const VehiclePalette &string_id<VehiclePalette>::obj() const
+{
+    const auto iter = vehicle_color_palettes.find( *this );
+    if( iter == vehicle_color_palettes.end() ) {
+        debugmsg( "invalid vehicle color palette id %s", c_str() );
+        static const VehiclePalette dummy{};
+        return dummy;
+    }
+    return iter->second;
+}
+
+/** @relates string_id */
+template<>
+bool string_id<VehiclePalette>::is_valid() const
+{
+    return vehicle_color_palettes.find( *this ) != vehicle_color_palettes.end();
+}
+
+void VehiclePalette::load( const JsonObject &jo )
+{
+    VehiclePalette &palette = vehicle_color_palettes[vpalette_id( jo.get_string( "id" ) )];
+
+    if( jo.has_bool( "clear" ) && jo.get_bool( "clear" ) ) {
+        palette.fuzzy_color_match.clear();
+        palette.colors.clear();
+    }
+    palette.id = vpalette_id( jo.get_string( "id" ) );
+    for( const JsonObject obj : jo.get_array( "palette" ) ) {
+        for( const std::string &id : obj.get_string_array( "fuzzy_ids" ) ) {
+            palette.fuzzy_color_match[id] = palette.colors.size();
+        }
+        weighted_int_list<std::string> weights;
+        for( const JsonObject col : obj.get_array( "colors" ) ) {
+            weights.add( col.get_string( "color" ), col.get_int( "weight" ) );
+        }
+        palette.colors.push_back( weights );
+    }
+}
+
+void VehiclePalette::check()
+{
+    for( const auto &palette : vehicle_color_palettes ) {
+        for( const auto &colorlist : palette.second.colors ) {
+            for( const auto &entry : colorlist ) {
+                const std::optional<RGBColor> color = RGBColor::try_parse( entry.first );
+                if( !color ) {
+                    debugmsg( "Invalid Color %s in Vehicle Palette %s", entry.first, palette.first.str() );
+                }
+            }
+        }
+    }
+}
+
+int VehiclePalette::fuzzy_to_index( const vpart_id &id ) const
+{
+    for( const auto &[fuzzy, index] : fuzzy_color_match ) {
+        if( id.str() == fuzzy || id.str().find( fuzzy ) != std::string::npos ) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+std::vector<std::optional<RGBColor>> VehiclePalette::pick_colors() const
+{
+    // One slot per color group, positionally aligned with fuzzy_to_index()'s
+    // return value: a group that rolls nothing (empty / all-zero-weight) keeps an
+    // empty slot instead of being skipped, so a later group is never silently
+    // shifted onto an earlier group's parts.
+    std::vector<std::optional<RGBColor>> result;
+    result.reserve( colors.size() );
+    for( const weighted_int_list<std::string> &colorlist : colors ) {
+        const std::string *colorstr = colorlist.pick();
+        if( !colorstr ) {
+            result.emplace_back();
+            continue;
+        }
+        const std::optional<RGBColor> color = RGBColor::try_parse( *colorstr );
+        if( !color ) {
+            debugmsg( "Invalid Color %s in Vehicle Palette %s", *colorstr, id.str() );
+        }
+        result.push_back( color );
+    }
+    return result;
+}
+
+void VehiclePalette::reset()
+{
+    vehicle_color_palettes.clear();
+}

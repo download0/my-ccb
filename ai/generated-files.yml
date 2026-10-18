@@ -1,0 +1,87 @@
+schema_version: 1
+kind: generated_files
+description: Files and artifacts that must be regenerated rather than hand-edited.
+entries:
+  - id: documentation-registry
+    paths: [ai/documentation-registry.yml]
+    tracked: true
+    generated_by: python3 tools/agent/generate_documentation_registry.py
+    validation_id: agent-context
+  - id: agent-benchmark-baseline
+    paths: [ai/agent-benchmark-baseline.json]
+    tracked: true
+    generated_by: python3 tools/agent/benchmark_context_pack.py
+    validation_id: agent-context
+  - id: markdown-migration-inventory
+    paths: [doc/migration/markdown-inventory.yml]
+    tracked: true
+    generated_by: python3 tools/agent/generate_markdown_inventory.py
+    validation_id: agent-context
+  - id: contributor-anomaly-report
+    paths: [doc/migration/contributor-anomalies.yml]
+    tracked: true
+    generated_by: python3 tools/agent/generate_markdown_inventory.py
+    validation_id: agent-context
+  - id: markdown-classification-report
+    paths: [doc/migration/classification-report.md]
+    tracked: true
+    generated_by: python3 tools/agent/generate_migration_reports.py
+    validation_id: agent-context
+  - id: markdown-migration-batches
+    paths: [doc/migration/migration-batches.yml]
+    tracked: true
+    generated_by: python3 tools/agent/generate_migration_reports.py
+    validation_id: agent-context
+  - id: version-header
+    paths: [src/version.h]
+    tracked: false
+    generated_by: build system version target
+    validation_id: cpp-tests
+  - id: prefix-header
+    paths: [src/prefix.h]
+    tracked: false
+    generated_by: build system prefix target
+    validation_id: cpp-tests
+  - id: compile-commands
+    paths: [compile_commands.json]
+    tracked: false
+    generated_by: CMake or make compile_commands.json
+    validation_id: cmake-configure
+  - id: json-formatter-binary
+    paths: [tools/format/json_formatter.cgi]
+    tracked: false
+    generated_by: make style-json or formatter target
+    validation_id: json-load
+  - id: lua-platform-native-inventory
+    paths: [data/lua/reference/ccb_platform_native_inventory.json]
+    tracked: true
+    generated_by: python3 tools/lua_api/generate_platform_native_inventory.py
+    validation_id: lua-contract
+  - id: lua-platform-public-contract
+    paths: [data/lua/reference/ccb_platform_api_v1.json]
+    tracked: true
+    generated_by: python3 tools/lua_api/generate_platform_contract.py
+    validation_id: lua-contract
+  - id: lua-platform-synchronization-coverage
+    paths: [data/lua/reference/ccb_platform_api_v1_coverage.json]
+    tracked: true
+    generated_by: python3 tools/lua_api/generate_platform_coverage.py
+    validation_id: lua-contract
+  - id: json-eoc-contract-inventories
+    paths:
+      - data/reference/json/ccb_json_object_types.json
+      - data/reference/json/ccb_eoc_conditions.json
+      - data/reference/json/ccb_eoc_effects.json
+    tracked: true
+    generated_by: python3 tools/json_api/generate_contracts.py
+    validation_id: json-eoc-contract
+  - id: lua-first-replacement-ledger
+    paths: [ai/lua-first-replacement-ledger.yml]
+    tracked: true
+    generated_by: python3 tools/agent/generate_lua_first_replacement_ledger.py
+    validation_id: agent-context
+  - id: shader-artifacts
+    paths: [data/shaders/*.spv, data/shaders/*.dxil, data/shaders/*.msl, data/shaders/build-*.stamp]
+    tracked: false
+    generated_by: shader build workflow
+    validation_id: cmake-configure

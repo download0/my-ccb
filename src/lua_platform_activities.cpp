@@ -1,0 +1,1672 @@
+#if CATA_ENABLE_LUA_PLATFORM
+
+#include "lua_platform_activities.h"
+
+#include <activity_actor.h>
+#include <activity_handlers.h>
+#include <calendar.h>
+#include <character_id.h>
+#include <clone_ptr.h>
+#include <coordinates.h>
+#include <enums.h>
+#include <game_inventory.h>
+#include <item_uid.h>
+#include <map_selector.h>
+#include <memory_fast.h>
+#include <monster_uid.h>
+#include <pickup.h>
+#include <point.h>
+#include <translation.h>
+#include <visitable.h>
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <list>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "activity_actor_definitions.h"
+#include "activity_type.h"
+#include "character.h"
+#include "game.h"
+#include "item.h"
+#include "item_location.h"
+#include "lua_platform_bindings_coords.h"
+#include "lua_platform_bindings_values.h"
+#include "lua_platform_handle.h"
+#include "map.h"
+#include "monster.h"
+#include "npc.h"
+#include "npctalk.h"
+#include "player_activity.h"
+#include "type_id.h"
+#include "units.h"
+
+namespace cata::lua_platform
+{
+
+namespace
+{
+
+constexpr std::int64_t maximum_activity_turns =
+    std::numeric_limits<int>::max() / 100;
+constexpr std::size_t maximum_activity_job_bytes = 64;
+constexpr std::size_t maximum_training_participants = 64;
+constexpr std::size_t maximum_backlog_snapshot = 128;
+constexpr std::size_t maximum_interruption_message_bytes = 8192;
+
+void require_active_callback(
+    const std::function<bool()> &has_active_callback,
+    const std::string_view api_name )
+{
+    if( !has_active_callback() ) {
+        throw std::runtime_error(
+            std::string( api_name ) + " is only available from an active callback" );
+    }
+}
+
+template<typename T>
+shared_ptr_fast<T> retain_activity_target( T &target )
+{
+    return g == nullptr ? shared_ptr_fast<T>() : g->shared_from( target );
+}
+
+struct pickup_at_options {
+    int extra_moves_per_item = 0;
+    units::volume max_volume = units::from_milliliter( -1 );
+    units::mass max_mass = units::from_milligram( std::int64_t{ -1000 } );
+};
+
+pickup_at_options read_pickup_at_options(
+    const sol::optional<sol::table> &requested )
+{
+    pickup_at_options result;
+    if( !requested ) {
+        return result;
+    }
+    for( const auto &entry : *requested ) {
+        if( entry.first.get_type() != sol::type::string ) {
+            throw std::invalid_argument(
+                "services.activities.pickup_at option names must be strings" );
+        }
+        const std::string key = entry.first.as<std::string>();
+        if( entry.second.get_type() != sol::type::number ) {
+            throw std::invalid_argument(
+                "services.activities.pickup_at options must be numeric" );
+        }
+        const double requested_value = entry.second.as<double>();
+        if( !std::isfinite( requested_value ) ) {
+            throw std::invalid_argument(
+                "services.activities.pickup_at options must be finite" );
+        }
+        if( key == "extra_moves_per_item" ) {
+            if( std::trunc( requested_value ) != requested_value ||
+                requested_value < std::numeric_limits<int>::lowest() ||
+                requested_value > std::numeric_limits<int>::max() ) {
+                throw std::invalid_argument(
+                    "services.activities.pickup_at extra_moves_per_item must be a native int" );
+            }
+            result.extra_moves_per_item = static_cast<int>( requested_value );
+        } else if( key == "max_volume_ml" ) {
+            const double native_value = std::trunc( requested_value );
+            const double native_upper_bound =
+                static_cast<double>( std::numeric_limits<int>::max() ) + 1.0;
+            if( native_value < std::numeric_limits<int>::lowest() ||
+                native_value >= native_upper_bound ) {
+                throw std::invalid_argument(
+                    "services.activities.pickup_at max_volume_ml must truncate to a native volume" );
+            }
+            result.max_volume = units::from_milliliter(
+                                    static_cast<int>( native_value ) );
+        } else if( key == "max_mass_g" ) {
+            const double milligrams = requested_value * 1000.0;
+            const double native_value = std::trunc( milligrams );
+            const double native_upper_bound =
+                -static_cast<double>( std::numeric_limits<std::int64_t>::lowest() );
+            if( !std::isfinite( milligrams ) ||
+                native_value < std::numeric_limits<std::int64_t>::lowest() ||
+                native_value >= native_upper_bound ) {
+                throw std::invalid_argument(
+                    "services.activities.pickup_at max_mass_g must convert to a native mass" );
+            }
+            result.max_mass = units::from_milligram(
+                                  static_cast<std::int64_t>( native_value ) );
+        } else {
+            throw std::invalid_argument(
+                "services.activities.pickup_at received unknown option '" + key + "'" );
+        }
+    }
+    return result;
+}
+
+struct activity_snapshot_data {
+    bool active = false;
+    std::optional<std::string> id;
+    std::string verb;
+    int moves_total = 0;
+    int moves_left = 0;
+    bool interruptible = false;
+    bool interruptible_with_keyboard = false;
+    bool auto_resume = false;
+    bool rooted = false;
+    bool resumable = false;
+    double progress = 0.0;
+};
+
+activity_snapshot_data capture_activity_snapshot(
+    const player_activity &current )
+{
+    activity_snapshot_data result;
+    const bool active = static_cast<bool>( current );
+    result.active = active;
+    if( active ) {
+        result.id = current.id().str();
+        result.verb = current.get_verb().translated();
+    }
+    result.moves_total = current.moves_total;
+    result.moves_left = current.moves_left;
+    result.interruptible = current.is_interruptible();
+    result.interruptible_with_keyboard = current.is_interruptible_with_kb();
+    result.auto_resume = current.auto_resume;
+    result.rooted = active && current.rooted();
+    result.resumable = active && current.can_resume();
+    if( active && current.moves_total > 0 && current.moves_left >= 0 ) {
+        result.progress = std::clamp(
+                              static_cast<double>(
+                                  current.moves_total - current.moves_left ) /
+                              current.moves_total, 0.0, 1.0 );
+    }
+    return result;
+}
+
+sol::table activity_snapshot(
+    sol::state_view lua, const activity_snapshot_data &data )
+{
+    sol::table result = lua.create_table();
+    result["active"] = data.active;
+    if( data.id ) {
+        result["id"] = script_game_id( "activity", *data.id );
+    } else {
+        result["id"] = sol::nil;
+    }
+    result["verb"] = data.verb;
+    result["moves_total"] = data.moves_total;
+    result["moves_left"] = data.moves_left;
+    result["interruptible"] = data.interruptible;
+    result["interruptible_with_keyboard"] = data.interruptible_with_keyboard;
+    result["auto_resume"] = data.auto_resume;
+    result["rooted"] = data.rooted;
+    result["resumable"] = data.resumable;
+    result["progress"] = data.progress;
+    return result;
+}
+
+struct character_activity_snapshot_data {
+    activity_snapshot_data activity;
+    std::size_t backlog_size = 0;
+    std::vector<activity_snapshot_data> backlog;
+};
+
+character_activity_snapshot_data capture_character_activity_snapshot(
+    const Character &character )
+{
+    character_activity_snapshot_data result;
+    result.activity = capture_activity_snapshot( character.activity );
+    result.backlog_size = character.backlog.size();
+    result.backlog.reserve( std::min( result.backlog_size,
+                                      maximum_backlog_snapshot ) );
+    for( const player_activity &entry : character.backlog ) {
+        if( result.backlog.size() >= maximum_backlog_snapshot ) {
+            break;
+        }
+        result.backlog.push_back( capture_activity_snapshot( entry ) );
+    }
+    return result;
+}
+
+sol::table character_activity_snapshot(
+    sol::state_view lua, const character_activity_snapshot_data &data )
+{
+    sol::table result = activity_snapshot( lua, data.activity );
+    result["backlog_size"] = data.backlog_size;
+    sol::table backlog = lua.create_table();
+    std::size_t index = 0;
+    for( const activity_snapshot_data &entry : data.backlog ) {
+        backlog[++index] = activity_snapshot( lua, entry );
+    }
+    result["backlog"] = std::move( backlog );
+    result["backlog_truncated"] = data.backlog_size > data.backlog.size();
+    return result;
+}
+
+time_duration checked_activity_duration(
+    const script_time_duration &duration,
+    const std::string &api_name )
+{
+    const std::int64_t turns = duration.turns();
+    if( turns <= 0 || turns > maximum_activity_turns ) {
+        throw std::invalid_argument(
+            api_name + " duration must resolve to 1.." +
+            std::to_string( maximum_activity_turns ) + " turns" );
+    }
+    return duration.to_native();
+}
+
+std::optional<item_location> owned_item_location(
+    Character &character, item *target )
+{
+    if( target == nullptr || target->is_null() ) {
+        return std::nullopt;
+    }
+    std::optional<item_location> result;
+    character.visit_items( [&character, target, &result]( item * candidate, item * ) {
+        if( candidate == target ) {
+            result.emplace( character, target );
+            return VisitResponse::ABORT;
+        }
+        return VisitResponse::NEXT;
+    } );
+    return result;
+}
+
+std::optional<item_location> resolve_owned_item_location(
+    Character &character, const game_handle &character_handle,
+    const game_handle &item_handle,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation,
+    std::optional<game_handle_error> &error )
+{
+    Character *resolved_character = nullptr;
+    item *resolved_item = nullptr;
+    if( !resolve_exact_item_for_character(
+            character_handle, item_handle,
+            runtime_generation, world_generation,
+            resolved_character, resolved_item, error ) ) {
+        return std::nullopt;
+    }
+    if( resolved_character != &character ) {
+        error = game_handle_error{
+            "not_owned",
+            "The activity character does not own the referenced item"
+        };
+        return std::nullopt;
+    }
+    std::optional<item_location> location =
+        owned_item_location( character, resolved_item );
+    if( !location ) {
+        error = game_handle_error{
+            "not_owned",
+            "The activity character does not own the referenced item"
+        };
+    }
+    return location;
+}
+
+talk_function::teach_domain checked_teach_domain(
+    const script_game_id &subject )
+{
+    if( !subject.is_valid() ) {
+        throw std::invalid_argument(
+            "services.activities.start_training requires a valid subject ID" );
+    }
+    talk_function::teach_domain result;
+    if( subject.kind() == "skill" ) {
+        result.skill = skill_id( subject.value() );
+    } else if( subject.kind() == "martial_art" ) {
+        result.style = matype_id( subject.value() );
+    } else if( subject.kind() == "spell" ) {
+        result.spell = spell_id( subject.value() );
+    } else if( subject.kind() == "proficiency" ) {
+        result.prof = proficiency_id( subject.value() );
+    } else {
+        throw std::invalid_argument(
+            "services.activities.start_training subject must be a skill, martial_art, spell, or proficiency ID" );
+    }
+    return result;
+}
+
+} // namespace
+
+void install_activity_api(
+    sol::table &services,
+    const std::function<game_handle_runtime()> &current_runtime_generation,
+    const std::function<std::size_t()> &current_world_generation,
+    const std::function<void()> &require_read,
+    const std::function<void()> &require_write,
+    const std::function<bool()> &has_active_callback,
+    activity_pickup_selector pickup_selector )
+{
+    sol::state_view lua( services.lua_state() );
+    sol::table activities = lua.create_table();
+    if( !pickup_selector ) {
+        pickup_selector = []( const std::set<tripoint_bub_ms> &targets,
+        Pickup::pick_info & info ) {
+            return game_menus::inv::pickup( targets, {}, info );
+        };
+    }
+
+    activities.set_function(
+        "snapshot",
+        [require_read, current_runtime_generation,
+                       current_world_generation](
+            sol::this_state lua,
+    const game_handle & handle ) {
+        require_read();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   handle, current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const character_activity_snapshot_data snapshot =
+            capture_character_activity_snapshot( *character );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, character_activity_snapshot(
+                           state, snapshot ) ) );
+    } );
+
+    activities.set_function(
+        "assign_timed",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & handle,
+            const script_game_id & id,
+    const script_time_duration & duration ) {
+        require_write();
+        if( id.kind() != "activity" || !id.is_valid() ) {
+            throw std::invalid_argument(
+                "services.activities.assign_timed requires a valid GameId<activity>" );
+        }
+        const time_duration native_duration =
+            checked_activity_duration(
+                duration, "services.activities.assign_timed" );
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   handle, current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const activity_id native_id( id.value() );
+        if( activity_actors::deserialize_functions.count( native_id ) != 0 ) {
+            return make_game_error_result( state, {
+                "specialized_activity",
+                "services.activities.assign_timed cannot construct an activity that requires a native actor"
+            } );
+        }
+        const activity_type &definition = native_id.obj();
+        if( activity_handlers::do_turn_functions.count( native_id ) != 0 ||
+            activity_handlers::finish_functions.count( native_id ) != 0 ) {
+            return make_game_error_result( state, {
+                "specialized_activity",
+                "services.activities.assign_timed cannot construct an activity with native turn or completion handlers"
+            } );
+        }
+        if( !definition.do_turn_EOC.is_null() ||
+            !definition.completion_EOC.is_null() ) {
+            return make_game_error_result( state, {
+                "legacy_activity_policy",
+                "services.activities.assign_timed never enters an EOC-backed activity policy"
+            } );
+        }
+        if( definition.based_on() != based_on_type::TIME ) {
+            return make_game_error_result( state, {
+                "not_timed_activity",
+                "services.activities.assign_timed requires a time-based activity"
+            } );
+        }
+        if( definition.multi_activity() || definition.valid_auto_needs() ) {
+            return make_game_error_result( state, {
+                "specialized_activity",
+                "services.activities.assign_timed cannot construct a managed activity workflow"
+            } );
+        }
+        character->assign_activity(
+            native_id, to_moves<int>( native_duration ) );
+        error.reset();
+        character = resolve_exact_character(
+                        handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        if( !character->activity ||
+            character->activity.id() != native_id ) {
+            return make_game_error_result( state, {
+                "assignment_rejected",
+                "Native character rules rejected the requested activity"
+            } );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["changed"] = true;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "assign_npc_job",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & handle,
+    const std::string & job ) {
+        require_write();
+        if( job.empty() || job.size() > maximum_activity_job_bytes ||
+            job.find( '\0' ) != std::string::npos ) {
+            throw std::invalid_argument(
+                "services.activities.assign_npc_job requires a bounded job name" );
+        }
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        npc *worker = resolve_exact_npc(
+                          handle, current_runtime_generation(),
+                          current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<npc> worker_lifetime =
+            retain_activity_target( *worker );
+        if( !worker_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const activity_snapshot_data before =
+            capture_activity_snapshot( worker->activity );
+        if( job == "sort_loot" ) {
+            worker->assign_activity( zone_sort_activity_actor() );
+        } else if( job == "construction" ) {
+            worker->assign_activity(
+                multi_build_construction_activity_actor() );
+        } else if( job == "mining" ) {
+            worker->assign_activity(
+                multi_mine_activity_actor( false ) );
+        } else if( job == "mopping" ) {
+            worker->assign_activity( multi_mop_activity_actor() );
+        } else if( job == "read" ) {
+            worker->do_npc_read();
+        } else if( job == "read_ebook" ) {
+            worker->do_npc_read( true );
+        } else if( job == "read_repeatedly" ) {
+            worker->assign_activity( multi_read_activity_actor() );
+        } else if( job == "study" ) {
+            worker->assign_activity( multi_study_activity_actor() );
+        } else if( job == "butcher" ) {
+            worker->assign_activity( multi_butchery_activity_actor() );
+        } else if( job == "chop_planks" ) {
+            worker->assign_activity(
+                multi_chop_planks_activity_actor() );
+        } else if( job == "vehicle_deconstruct" ) {
+            worker->assign_activity(
+                multi_vehicle_deconstruct_activity_actor() );
+        } else if( job == "vehicle_repair" ) {
+            worker->assign_activity(
+                multi_vehicle_repair_activity_actor() );
+        } else if( job == "chop_trees" ) {
+            worker->assign_activity(
+                multi_chop_trees_activity_actor() );
+        } else if( job == "farming" ) {
+            worker->assign_activity( multi_farm_activity_actor() );
+        } else if( job == "fishing" ) {
+            worker->assign_activity( multi_fish_activity_actor() );
+        } else if( job == "craft" ) {
+            worker->do_npc_craft();
+        } else if( job == "disassembly" ) {
+            worker->assign_activity(
+                multi_disassemble_activity_actor() );
+        } else if( job == "find_mount" ) {
+            monster *mount = nullptr;
+            if( g != nullptr ) {
+                for( monster &candidate : g->all_monsters() ) {
+                    if( worker->can_mount( candidate ) ) {
+                        mount = &candidate;
+                        break;
+                    }
+                }
+            }
+            if( mount == nullptr ) {
+                if( worker->has_player_activity() ) {
+                    worker->revert_after_activity();
+                }
+                return make_game_error_result( state, {
+                    "no_match", "No mountable creature is available"
+                } );
+            }
+            const shared_ptr_fast<monster> mount_lifetime =
+                g->shared_from( *mount );
+            if( !mount_lifetime ) {
+                return make_game_error_result( state, {
+                    "stale_mount", "The selected mount is no longer active"
+                } );
+            }
+            worker->chosen_mount = mount_lifetime;
+            worker->assign_activity( find_mount_activity_actor(
+                                         mount_lifetime->uid().get_value() ) );
+            error.reset();
+            worker = resolve_exact_npc(
+                         handle, current_runtime_generation(),
+                         current_world_generation(), error );
+            if( worker == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+        } else {
+            throw std::invalid_argument(
+                "services.activities.assign_npc_job received an unknown job" );
+        }
+        error.reset();
+        worker = resolve_exact_npc(
+                     handle, current_runtime_generation(),
+                     current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        if( !worker->activity ) {
+            return make_game_error_result( state, {
+                "assignment_rejected",
+                "Native NPC rules rejected the requested job"
+            } );
+        }
+        const activity_snapshot_data after =
+            capture_activity_snapshot( worker->activity );
+        const std::string mission = io::enum_to_string( worker->mission );
+        const std::string attitude = npc_attitude_id( worker->get_attitude() );
+        sol::table value = state.create_table();
+        value["job"] = job;
+        value["before"] = activity_snapshot( state, before );
+        value["after"] = activity_snapshot( state, after );
+        value["mission"] = mission;
+        value["attitude"] = attitude;
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "dismount",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & npc_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        npc *worker = resolve_exact_npc(
+                          npc_handle, current_runtime_generation(),
+                          current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const bool before = worker->is_mounted();
+        if( before ) {
+            worker->npc_dismount();
+        }
+        error.reset();
+        worker = resolve_exact_npc(
+                     npc_handle, current_runtime_generation(),
+                     current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const bool mounted_after = worker->is_mounted();
+        sol::table value = state.create_table();
+        value["accepted"] = before;
+        value["changed"] = before && !mounted_after;
+        value["mounted_before"] = before;
+        value["mounted_after"] = mounted_after;
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "drop_nonfavorite_items",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & npc_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        npc *worker = resolve_exact_npc(
+                          npc_handle, current_runtime_generation(),
+                          current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<npc> worker_lifetime =
+            retain_activity_target( *worker );
+        if( !worker_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        std::vector<drop_or_stash_item_info> to_drop;
+        for( const item_location &entry : worker->all_items_loc() ) {
+            if( !entry->is_favorite &&
+                entry.where() == item_location::type::container &&
+                entry.parent_item().where() ==
+                item_location::type::character ) {
+                to_drop.emplace_back( entry, entry->count() );
+            }
+        }
+        const std::size_t selected = to_drop.size();
+        if( !to_drop.empty() ) {
+            worker->assign_activity(
+                drop_activity_actor(
+                    to_drop, tripoint_rel_ms::zero, false ) );
+        }
+        error.reset();
+        worker = resolve_exact_npc(
+                     npc_handle, current_runtime_generation(),
+                     current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( worker->activity );
+        sol::table value = state.create_table();
+        value["accepted"] = selected != 0;
+        value["selected"] = selected;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "revert_npc_job",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        npc *worker = resolve_exact_npc(
+                          handle, current_runtime_generation(),
+                          current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data before =
+            capture_activity_snapshot( worker->activity );
+        const bool changed = static_cast<bool>( worker->activity ) ||
+                             worker->has_player_activity();
+        // Native restoration also resets mission, attitude, destination and
+        // backlog when there is no active job.
+        worker->revert_after_activity();
+        error.reset();
+        worker = resolve_exact_npc(
+                     handle, current_runtime_generation(),
+                     current_world_generation(), error );
+        if( worker == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data after =
+            capture_activity_snapshot( worker->activity );
+        const std::string mission = io::enum_to_string( worker->mission );
+        const std::string attitude = npc_attitude_id( worker->get_attitude() );
+        sol::table value = state.create_table();
+        value["changed"] = changed;
+        value["restored"] = true;
+        value["before"] = activity_snapshot( state, before );
+        value["after"] = activity_snapshot( state, after );
+        value["mission"] = mission;
+        value["attitude"] = attitude;
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "socialize",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const game_handle & partner_handle,
+    const script_time_duration & duration ) {
+        require_write();
+        const time_duration native_duration =
+            checked_activity_duration(
+                duration, "services.activities.socialize" );
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        npc *partner = resolve_exact_npc(
+                           partner_handle,
+                           current_runtime_generation(),
+                           current_world_generation(), error );
+        if( partner == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        if( !character->is_avatar() ) {
+            return make_game_error_result( state, {
+                "wrong_target",
+                "Native socializing currently requires the avatar as the acting character"
+            } );
+        }
+        const character_id partner_id = partner->getID();
+        character->assign_activity(
+            socialize_activity_actor(
+                native_duration, partner_id ) );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["partner_id"] = partner_id.get_value();
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "read",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const game_handle & book_handle,
+            const script_time_duration & duration,
+            const sol::optional<game_handle> &ereader_handle,
+            const sol::optional<bool> &continuous,
+    const sol::optional<game_handle> &learner_handle ) {
+        require_write();
+        const time_duration native_duration =
+            checked_activity_duration(
+                duration, "services.activities.read" );
+        sol::state_view state( lua );
+        const game_handle_runtime runtime =
+            current_runtime_generation();
+        const std::size_t world = current_world_generation();
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle, runtime,
+                                   world, error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        std::optional<item_location> book =
+            resolve_owned_item_location(
+                *character, character_handle, book_handle,
+                runtime, world, error );
+        if( !book ) {
+            return make_game_error_result( state, *error );
+        }
+        if( !( **book ).is_book() ) {
+            return make_game_error_result( state, {
+                "wrong_item", "The referenced item is not a readable book"
+            } );
+        }
+        item_location ereader;
+        if( ereader_handle ) {
+            std::optional<item_location> resolved_ereader =
+                resolve_owned_item_location(
+                    *character, character_handle, *ereader_handle,
+                    runtime, world, error );
+            if( !resolved_ereader ) {
+                return make_game_error_result( state, *error );
+            }
+            ereader = *resolved_ereader;
+        }
+        int learner_id = -1;
+        if( learner_handle ) {
+            Character *learner = resolve_exact_character(
+                                     *learner_handle, runtime,
+                                     world, error );
+            if( learner == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+            learner_id = learner->getID().get_value();
+        }
+        item_location native_book = *book;
+        const std::int64_t book_uid = ( **book ).uid().get_value();
+        character->assign_activity(
+            read_activity_actor(
+                native_duration, native_book, ereader,
+                continuous.value_or( false ), learner_id ) );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["book_uid"] = book_uid;
+        value["continuous"] = continuous.value_or( false );
+        value["learner_id"] = learner_id;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "drop_item",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const game_handle & item_handle,
+            const std::int64_t quantity,
+            const sol::optional<script_tripoint_coord> &placement,
+    const sol::optional<bool> &force_ground ) {
+        require_write();
+        if( quantity <= 0 ||
+            quantity > std::numeric_limits<int>::max() ) {
+            throw std::invalid_argument(
+                "services.activities.drop_item quantity is outside native bounds" );
+        }
+        sol::state_view state( lua );
+        if( !placement ) {
+            return make_game_error_result( state, {
+                "missing_placement",
+                "services.activities.drop_item requires an explicit relative map-square placement"
+            } );
+        }
+        if( placement->native_origin() != coords::origin::relative ||
+            placement->native_scale() != coords::scale::map_square ) {
+            throw std::invalid_argument(
+                "services.activities.drop_item placement must be a relative map-square Tripoint" );
+        }
+        const tripoint_rel_ms native_placement = tripoint_rel_ms(
+                    placement->to_native() );
+        const game_handle_runtime runtime =
+            current_runtime_generation();
+        const std::size_t world = current_world_generation();
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle, runtime,
+                                   world, error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        std::optional<item_location> location =
+            resolve_owned_item_location(
+                *character, character_handle, item_handle,
+                runtime, world, error );
+        if( !location ) {
+            return make_game_error_result( state, *error );
+        }
+        if( quantity > ( **location ).count() ) {
+            return make_game_error_result( state, {
+                "insufficient_quantity",
+                "The requested drop quantity exceeds the item count"
+            } );
+        }
+        const std::int64_t item_uid = ( **location ).uid().get_value();
+        retire_item_handle_identity( **location );
+        const std::vector<drop_or_stash_item_info> items = {
+            drop_or_stash_item_info(
+                *location, static_cast<int>( quantity ) )
+        };
+        character->assign_activity(
+            drop_activity_actor(
+                items, native_placement,
+                force_ground.value_or( false ) ) );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["quantity"] = quantity;
+        value["item_uid"] = item_uid;
+        value["input_handle_retired"] = true;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "pickup_item",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const game_handle & item_handle,
+            const std::int64_t quantity,
+    const sol::optional<bool> &autopickup ) {
+        require_write();
+        if( quantity <= 0 ||
+            quantity > std::numeric_limits<int>::max() ) {
+            throw std::invalid_argument(
+                "services.activities.pickup_item quantity is outside native bounds" );
+        }
+        sol::state_view state( lua );
+        const game_handle_runtime runtime =
+            current_runtime_generation();
+        const std::size_t world = current_world_generation();
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle, runtime,
+                                   world, error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const native_handle_result<item> resolved =
+            item_handle.resolve_item( runtime, world );
+        if( !resolved ) {
+            return make_game_error_result(
+                       state, *resolved.error );
+        }
+        const game_handle_locator &locator =
+            item_handle.locator();
+        if( locator.scope != "map" || !locator.path.empty() ) {
+            return make_game_error_result( state, {
+                "wrong_location",
+                "services.activities.pickup_item requires a top-level map item handle"
+            } );
+        }
+        map &here = get_map();
+        const tripoint_abs_ms absolute(
+            locator.x, locator.y, locator.z );
+        if( !here.inbounds( absolute ) ) {
+            return make_game_error_result( state, {
+                "out_of_bounds",
+                "The pickup item is outside the active map"
+            } );
+        }
+        map_stack stack = here.i_at(
+                              here.get_bub( absolute ) );
+        const auto found = std::find_if(
+                               stack.begin(), stack.end(),
+        [&resolved]( item & candidate ) {
+            return &candidate == resolved.value;
+        } );
+        if( found == stack.end() ) {
+            return make_game_error_result( state, {
+                "wrong_location",
+                "The referenced item is no longer at its map position"
+            } );
+        }
+        const std::int64_t available =
+            found->count_by_charges() ? found->charges : 1;
+        if( quantity > available ||
+            ( !found->count_by_charges() && quantity != 1 ) ) {
+            return make_game_error_result( state, {
+                "insufficient_quantity",
+                "The requested pickup quantity is unavailable"
+            } );
+        }
+        const std::vector<item_location> targets = {
+            item_location(
+                map_cursor( absolute ), &*found )
+        };
+        const std::vector<int> quantities = {
+            static_cast<int>( quantity )
+        };
+        const std::int64_t item_uid = found->uid().get_value();
+        retire_item_handle_identity( *found );
+        character->assign_activity(
+            pickup_activity_actor(
+                targets, quantities,
+                character->pos_bub(),
+                autopickup.value_or( false ) ) );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["quantity"] = quantity;
+        value["item_uid"] = item_uid;
+        value["input_handle_retired"] = true;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+    activities.set_function(
+        "pickup_at",
+        [require_write, has_active_callback, pickup_selector,
+                        current_runtime_generation, current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const script_tripoint_coord & target,
+    const sol::optional<sol::table> &requested_options ) {
+        constexpr std::string_view api_name = "services.activities.pickup_at";
+        require_write();
+        require_active_callback( has_active_callback, api_name );
+        const pickup_at_options options = read_pickup_at_options(
+                                              requested_options );
+        if( target.native_origin() != coords::origin::abs ||
+            target.native_scale() != coords::scale::map_square ) {
+            throw std::invalid_argument(
+                "services.activities.pickup_at target must be an absolute map-square Tripoint" );
+        }
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const tripoint_abs_ms target_abs( target.to_native() );
+        const tripoint_bub_ms target_local = get_map().get_bub( target_abs );
+        Pickup::pick_info info(
+            options.extra_moves_per_item, options.max_volume, options.max_mass );
+        const drop_locations selected = pickup_selector(
+        { target_local }, info );
+        if( !selected.empty() ) {
+            // Native f_pickup_items uses pick_info for the picker, then calls
+            // Character::pick_up(drop_locations) without passing it to the
+            // activity actor.  Keep that boundary: limits affect selection only.
+            character->pick_up( selected );
+        }
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["scheduled"] = !selected.empty();
+        value["selected_count"] = static_cast<std::int64_t>( selected.size() );
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object( state, std::move( value ) ) );
+    } );
+    activities.set_function(
+        "start_training",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & teacher_handle,
+            const sol::table & trainee_handles,
+            const script_game_id & subject_id,
+    const script_time_duration & duration ) {
+        require_write();
+        const std::size_t participant_count =
+            trainee_handles.size();
+        if( participant_count == 0 ||
+            participant_count > maximum_training_participants ) {
+            throw std::invalid_argument(
+                "services.activities.start_training requires 1..64 trainees" );
+        }
+        const time_duration native_duration =
+            checked_activity_duration(
+                duration, "services.activities.start_training" );
+        const talk_function::teach_domain subject =
+            checked_teach_domain( subject_id );
+        sol::state_view state( lua );
+        const game_handle_runtime runtime =
+            current_runtime_generation();
+        const std::size_t world = current_world_generation();
+        std::optional<game_handle_error> error;
+        Character *teacher = resolve_exact_character(
+                                 teacher_handle, runtime,
+                                 world, error );
+        if( teacher == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> teacher_lifetime =
+            retain_activity_target( *teacher );
+        if( !teacher_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const character_id teacher_id = teacher->getID();
+        std::vector<game_handle> trainee_handles_native;
+        std::vector<character_id> trainee_ids;
+        std::set<character_id> unique_ids;
+        trainee_handles_native.reserve( participant_count );
+        trainee_ids.reserve( participant_count );
+        for( std::size_t index = 1;
+             index <= participant_count; ++index ) {
+            const sol::object value =
+                trainee_handles.raw_get<sol::object>( index );
+            if( !value.is<game_handle>() ) {
+                throw std::invalid_argument(
+                    "services.activities.start_training trainees must be a dense GameHandle array" );
+            }
+            const game_handle &trainee_handle = value.as<game_handle>();
+            Character *trainee = resolve_exact_character(
+                                     trainee_handle,
+                                     runtime, world, error );
+            if( trainee == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+            const character_id trainee_id = trainee->getID();
+            if( trainee_id == teacher_id ||
+                !unique_ids.insert( trainee_id ).second ) {
+                throw std::invalid_argument(
+                    "services.activities.start_training trainees must be unique and exclude the teacher" );
+            }
+            trainee_handles_native.push_back( trainee_handle );
+            trainee_ids.push_back( trainee_id );
+        }
+        error.reset();
+        teacher = resolve_exact_character(
+                      teacher_handle, current_runtime_generation(),
+                      current_world_generation(), error );
+        if( teacher == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const training_activity_actor teaching_assignment(
+            native_duration, subject, trainee_ids );
+        teacher->assign_activity( teaching_assignment );
+        error.reset();
+        teacher = resolve_exact_character(
+                      teacher_handle, current_runtime_generation(),
+                      current_world_generation(), error );
+        if( teacher == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const auto *accepted_teaching =
+            dynamic_cast<const training_activity_actor *>( teacher->activity.actor.get() );
+        if( !teacher->activity || accepted_teaching == nullptr ||
+            !accepted_teaching->matches_assignment( teaching_assignment ) ) {
+            return make_game_error_result( state, {
+                "assignment_rejected",
+                "A synchronous activity callback replaced the teaching activity"
+            } );
+        }
+        const std::uint64_t teaching_identity = teacher->activity.identity_generation();
+        for( const game_handle &trainee_handle : trainee_handles_native ) {
+            error.reset();
+            teacher = resolve_exact_character(
+                          teacher_handle, current_runtime_generation(),
+                          current_world_generation(), error );
+            if( teacher == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+            if( !teacher->activity || teacher->activity.identity_generation() != teaching_identity ) {
+                return make_game_error_result( state, {
+                    "assignment_rejected",
+                    "A synchronous activity callback replaced the teaching activity"
+                } );
+            }
+            error.reset();
+            Character *trainee = resolve_exact_character(
+                                     trainee_handle,
+                                     current_runtime_generation(),
+                                     current_world_generation(), error );
+            if( trainee == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+            const shared_ptr_fast<Character> trainee_lifetime =
+                retain_activity_target( *trainee );
+            if( !trainee_lifetime ) {
+                return make_game_error_result( state, {
+                    "inactive_character",
+                    "The activity target is not owned by the active game"
+                } );
+            }
+            trainee->assign_activity(
+                training_activity_actor(
+                    native_duration, subject,
+                    teacher_id ) );
+        }
+        std::vector<character_activity_snapshot_data> trainee_snapshots;
+        trainee_snapshots.reserve( trainee_handles_native.size() );
+        for( const game_handle &trainee_handle : trainee_handles_native ) {
+            error.reset();
+            Character *trainee = resolve_exact_character(
+                                     trainee_handle,
+                                     current_runtime_generation(),
+                                     current_world_generation(), error );
+            if( trainee == nullptr ) {
+                return make_game_error_result( state, *error );
+            }
+            trainee_snapshots.push_back(
+                capture_character_activity_snapshot( *trainee ) );
+        }
+        error.reset();
+        teacher = resolve_exact_character(
+                      teacher_handle, current_runtime_generation(),
+                      current_world_generation(), error );
+        if( teacher == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        if( !teacher->activity || teacher->activity.identity_generation() != teaching_identity ) {
+            return make_game_error_result( state, {
+                "assignment_rejected",
+                "A synchronous activity callback replaced the teaching activity"
+            } );
+        }
+        const character_activity_snapshot_data teacher_snapshot =
+            capture_character_activity_snapshot( *teacher );
+        sol::table trainee_states = state.create_table(
+                                        static_cast<int>( trainee_snapshots.size() ), 0 );
+        for( std::size_t index = 0;
+             index < trainee_snapshots.size(); ++index ) {
+            trainee_states[index + 1] =
+                character_activity_snapshot(
+                    state, trainee_snapshots[index] );
+        }
+        sol::table value = state.create_table();
+        value["subject"] = subject_id;
+        value["teacher"] = character_activity_snapshot(
+                               state, teacher_snapshot );
+        value["trainees"] = std::move( trainee_states );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "wait_for_npc",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+            const game_handle & character_handle,
+            const game_handle & npc_handle,
+    const script_time_duration & duration ) {
+        require_write();
+        const time_duration native_duration =
+            checked_activity_duration(
+                duration, "services.activities.wait_for_npc" );
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        npc *waited_for = resolve_exact_npc(
+                              npc_handle,
+                              current_runtime_generation(),
+                              current_world_generation(), error );
+        if( waited_for == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const int npc_id = waited_for->getID().get_value();
+        const std::string npc_name = waited_for->get_name();
+        character->assign_activity(
+            wait_npc_activity_actor( native_duration, npc_name ) );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        sol::table value = state.create_table();
+        value["npc_id"] = npc_id;
+        value["activity"] = activity_snapshot( state, activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "target_practice",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & character_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        character->assign_activity(
+            target_practice_activity_actor() );
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const activity_snapshot_data activity =
+            capture_activity_snapshot( character->activity );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, activity_snapshot( state, activity ) ) );
+    } );
+
+    activities.set_function(
+        "suspend",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & character_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        if( !character->activity ) {
+            return make_game_error_result( state, {
+                "no_activity", "The character has no active activity"
+            } );
+        }
+        if( !character->activity.can_resume() ) {
+            return make_game_error_result( state, {
+                "not_resumable",
+                "The active activity cannot be suspended"
+            } );
+        }
+        const activity_id suspended_id =
+            character->activity.id();
+        character->cancel_activity();
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const character_activity_snapshot_data snapshot =
+            capture_character_activity_snapshot( *character );
+        sol::table value = state.create_table();
+        value["suspended"] = script_game_id(
+                                 "activity", suspended_id.str() );
+        value["state"] = character_activity_snapshot( state, snapshot );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "resume",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & character_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        if( character->activity ) {
+            return make_game_error_result( state, {
+                "activity_active",
+                "The current activity must finish or be suspended before resuming another"
+            } );
+        }
+        if( character->backlog.empty() ) {
+            return make_game_error_result( state, {
+                "empty_backlog",
+                "The character has no suspended activity"
+            } );
+        }
+        character->backlog.front().auto_resume = true;
+        character->resume_backlog_activity();
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const bool resumed = static_cast<bool>( character->activity );
+        const character_activity_snapshot_data snapshot =
+            capture_character_activity_snapshot( *character );
+        sol::table value = state.create_table();
+        value["resumed"] = resumed;
+        value["state"] = character_activity_snapshot( state, snapshot );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "clear_backlog",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & character_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const std::size_t removed = character->backlog.size();
+        character->backlog.clear();
+        const character_activity_snapshot_data snapshot =
+            capture_character_activity_snapshot( *character );
+        sol::table value = state.create_table();
+        value["removed"] = removed;
+        value["state"] = character_activity_snapshot( state, snapshot );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "cancel",
+        [require_write, current_runtime_generation,
+                        current_world_generation](
+            sol::this_state lua,
+    const game_handle & character_handle ) {
+        require_write();
+        sol::state_view state( lua );
+        std::optional<game_handle_error> error;
+        Character *character = resolve_exact_character(
+                                   character_handle,
+                                   current_runtime_generation(),
+                                   current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const shared_ptr_fast<Character> character_lifetime =
+            retain_activity_target( *character );
+        if( !character_lifetime ) {
+            return make_game_error_result( state, {
+                "inactive_character",
+                "The activity target is not owned by the active game"
+            } );
+        }
+        const bool had_activity = static_cast<bool>( character->activity );
+        const std::size_t backlog_size_before = character->backlog.size();
+        const bool backlog_auto_resume_before =
+            !character->backlog.empty() &&
+            character->backlog.front().auto_resume;
+        character->cancel_activity();
+        error.reset();
+        character = resolve_exact_character(
+                        character_handle, current_runtime_generation(),
+                        current_world_generation(), error );
+        if( character == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        const bool backlog_auto_resume_after =
+            !character->backlog.empty() &&
+            character->backlog.front().auto_resume;
+        const bool changed = had_activity ||
+                             backlog_size_before != character->backlog.size() ||
+                             ( backlog_auto_resume_before &&
+                               !backlog_auto_resume_after );
+        const character_activity_snapshot_data snapshot =
+            capture_character_activity_snapshot( *character );
+        sol::table value = state.create_table();
+        value["changed"] = changed;
+        value["activity"] = character_activity_snapshot( state, snapshot );
+        return make_game_value_result(
+                   state, sol::make_object(
+                       state, std::move( value ) ) );
+    } );
+
+    activities.set_function(
+        "offer_interruption",
+    [require_write]( const std::string & reason ) {
+        require_write();
+        if( reason.size() > maximum_interruption_message_bytes ||
+            reason.find( '\0' ) != std::string::npos ) {
+            throw std::invalid_argument(
+                "services.activities.offer_interruption reason exceeds its native string limit" );
+        }
+        if( g == nullptr ) {
+            throw std::runtime_error(
+                "services.activities.offer_interruption requires an active game" );
+        }
+        return g->cancel_activity_or_ignore_query(
+                   distraction_type::eoc, reason );
+    } );
+
+    activities.set_function(
+        "offer_portal_storm_interruption",
+    [require_write]( const std::string & message ) {
+        require_write();
+        if( message.empty() ||
+            message.size() > maximum_interruption_message_bytes ||
+            message.find( '\0' ) != std::string::npos ) {
+            throw std::invalid_argument(
+                "services.activities.offer_portal_storm_interruption message exceeds its native string limit" );
+        }
+        if( g == nullptr ) {
+            throw std::runtime_error(
+                "services.activities.offer_portal_storm_interruption requires an active game" );
+        }
+        return g->portal_storm_query(
+                   distraction_type::portal_storm_popup, message );
+    } );
+
+    services["activities"] = std::move( activities );
+}
+
+} // namespace cata::lua_platform
+
+#endif // CATA_ENABLE_LUA_PLATFORM

@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# Script made specifically for compiling without running tests on GitHub Actions
+
+echo "Using bash version $BASH_VERSION"
+set -exo pipefail
+
+# Android build is its own separate thing, only bundled here for invocation convenience
+if [ -n "$ANDROID" ]
+then
+    cd ./android
+    chmod +x gradlew
+    if [ ${ANDROID} = "arm64" ]
+    then
+        ./gradlew -Pj=$((`nproc`+0)) -Pabi_arm_32=false -Pprebuilt_shaders=true assembleExperimentalRelease
+    elif [ ${ANDROID} = "arm32" ]
+    then
+        ./gradlew -Pj=$((`nproc`+0)) -Pabi_arm_64=false -Pprebuilt_shaders=true assembleExperimentalRelease
+    elif [ ${ANDROID} = "bundle" ]
+    then
+        ./gradlew -Pj=$((`nproc`+0)) -Pprebuilt_shaders=true bundleExperimentalRelease
+    else
+        echo "Unexpected value of ANDROID env var - '${ANDROID}'"
+        exit 1
+    fi
+    exit 0  # no fallthrough
+fi
+
+num_jobs=${NUM_BUILD_JOBS:-3}
+
+# We might need binaries installed via pip, so ensure that our personal bin dir is on the PATH
+export PATH=$HOME/.local/bin:$PATH
+
+if [ -n "$CROSS_COMPILATION" ]
+then
+    "$CROSS_COMPILATION$COMPILER" --version
+else
+    $COMPILER --version
+fi
+
+if [ -n "$TEST_STAGE" ]
+then
+    build-scripts/validate_json.py
+
+    tools/dialogue_validator.py data/json/npcs/* data/json/npcs/*/* data/json/npcs/*/*/*
+
+    tools/json_tools/generic_guns_validator.py
+
+    tools/json_tools/gun_variant_validator.py -v -cin data/json
+
+    # Also build chkjson (even though we're not using it), to catch any
+    # compile errors there
+    make -j "$num_jobs" chkjson
+# Skip the rest of the run if this change is pure json and this job doesn't test any extra mods
+elif [ -n "$JUST_JSON" -a -z "$MODS" ]
+then
+    echo "Early exit on just-json change"
+    exit 0
+fi
+
+ccache --zero-stats
+# Increase cache size because debug builds generate large object files
+ccache -M 20G
+ccache --show-stats --verbose
+
+if [ "$CMAKE" = "1" ]
+then
+    if [ "$RELEASE" = "1" ]
+    then
+        build_type=MinSizeRel
+    else
+        build_type=Debug
+    fi
+
+    cmake -S . -B build \
+        -DBACKTRACE=ON \
+        ${COMPILER:+-DCMAKE_CXX_COMPILER=$COMPILER} \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF \
+        -DCMAKE_BUILD_TYPE="$build_type" \
+        -DCATA_ENABLE_LUA_PLATFORM="${CATA_ENABLE_LUA_PLATFORM:-1}" \
+        -DTESTS="${TESTS:-1}" -DBUILD_TESTING="${TESTS:-1}" \
+        -DCATA_TEST_SUITE="${CATA_TEST_SUITE:-all}" \
+        -DLOCALIZE="${LOCALIZE:-1}" \
+        -DTILES=${TILES:-0} \
+        -DSOUND=${SOUND:-0} \
+        ${SDL3:+-DUSE_SDL3=${SDL3}}
+    cmake --build build --parallel "$num_jobs"
+else
+    # The linter workflow owns formatting; compile jobs do not repeat it.
+    make_args=( CCACHE=1 CROSS="$CROSS_COMPILATION" LINTJSON=0 ASTYLE=0 )
+    # Full debug information substantially increases GCC's memory use for the
+    # monolithic Lua Platform translation unit.  Keep it for artifact-
+    # producing jobs, but let selected compile-only matrix legs use Make's
+    # release default (-g1) when they do not publish a debug-symbol artifact.
+    if [ "${FULL_DEBUG_SYMBOLS:-1}" = "1" ]; then
+        make_args+=( DEBUG_SYMBOLS=1 )
+    fi
+    if [ -n "${SDL3+x}" ]; then
+        make_args+=( SDL3="$SDL3" )
+    fi
+    if [ "${NATIVE:-}" = "osx" ] && [ "${TILES:-0}" = "1" ]; then
+        make_args+=( UNIVERSAL_BINARY=1 )
+    fi
+    make -j "$num_jobs" "${make_args[@]}"
+
+fi
+
+# vim:tw=0

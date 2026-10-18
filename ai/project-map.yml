@@ -1,0 +1,93 @@
+schema_version: 1
+kind: project_map
+description: Offline subsystem routing for human contributors and agents.
+entries:
+  - id: engine
+    paths: [src/]
+    purpose: Native C++ engine, gameplay, UI, and Lua bindings.
+    instructions: src/AGENTS.md
+    validation_ids: [cpp-format, cpp-tests]
+    boundaries:
+      - Runtime behaviour is defined by source and tests.
+      - Public JSON and Lua changes require contract-impact review.
+  - id: core-data
+    paths: [data/core/, data/json/]
+    purpose: Core JSON definitions loaded by the game.
+    instructions: data/AGENTS.md
+    validation_ids: [json-load]
+    boundaries:
+      - Preserve stable IDs or provide explicit migration data.
+  - id: lua-api
+    paths: [data/lua/types/ccb_platform_v1.d.lua, 'data/lua/reference/ccb_platform_*', tools/lua_api/, tools/create_lua_mod.py, tools/test_create_lua_mod.py, data/lua/templates/, src/main.cpp, src/game_io.cpp, src/lua_platform_loader.cpp, src/lua_platform_runtime.cpp, 'src/lua_platform*.cpp', 'src/lua_platform*.h']
+    purpose: Lua-first Platform v1 declarations, native inventory, public contract, synchronization coverage, and contract checks.
+    instructions: data/lua/AGENTS.md
+    validation_ids: [lua-contract, lua-authoring]
+    boundaries:
+      - Platform v1 declarations, registrations, generated inventory, and contract checks are authoritative.
+      - This is a contract-validation route within the sole Platform runtime, not a second Lua system.
+  - id: lua-first-platform
+    paths: [data/lua/, data/mods/Lua_First_Example/, ai/lua-first-roadmap.yml, ai/lua-first-roadmap.schema.json, ai/lua-first-replacement-ledger.yml, ai/lua-first-replacement-ledger.schema.json, tools/lua_api/, tools/agent/*lua_first*, tools/create_lua_mod.py, tools/migrate_lua_first.py, 'src/lua_platform*.cpp', 'src/lua_platform*.h', src/mod_manager.cpp, src/mod_manager.h, src/mod_manager_ui.cpp, src/game_io.cpp, src/game.cpp, src/do_turn.cpp]
+    purpose: Sole CCB Lua runtime, pure-Lua authoring architecture, EOC-capability workflow, replacement boundary, and checked implementation roadmap.
+    instructions: data/lua/AGENTS.md
+    validation_ids: [agent-context]
+    boundaries:
+      - The architecture contract defines target design; source and tests alone prove a capability is available.
+      - Public Platform APIs use native domain objects and services rather than exposing JSON loaders or EOC-key-shaped wrappers.
+      - API v5, CBN compatibility, authored Lua manifests, `game.*`, and a second Lua state are prohibited.
+      - Core serialization such as saves, settings, caches, and generated inventories may remain JSON internally.
+      - The exact replacement ledger distinguishes implemented, bounded-implemented, primitive-available, planned, private-adapter, and reviewed-not-applicable selectors.
+      - Migration output is a reviewable Lua skeleton plus explicit TODO report, never a hidden JSON/EOC compatibility call.
+  - id: bundled-mods
+    paths: [data/mods/]
+    purpose: Mods shipped and validated with CCB.
+    instructions: data/mods/AGENTS.md
+    validation_ids: [json-load]
+    boundaries:
+      - Each mod is an independent compatibility surface.
+  - id: tests
+    paths: [tests/]
+    purpose: Catch2 regression and integration tests.
+    instructions: tests/AGENTS.md
+    validation_ids: [cpp-tests]
+    boundaries:
+      - Tests must be deterministic and behaviour-focused.
+  - id: developer-tools
+    paths: [tools/]
+    purpose: Formatters, validators, generators, and maintenance automation.
+    instructions: tools/AGENTS.md
+    validation_ids: [agent-context, python-tools]
+    boundaries:
+      - Generators provide a non-mutating check mode.
+  - id: android
+    paths: [android/]
+    purpose: Android Gradle application, Java UI, and native packaging.
+    instructions: android/AGENTS.md
+    validation_ids: [android-unit]
+    boundaries:
+      - Never commit SDK paths, signing material, APKs, or local Gradle state.
+  - id: build
+    paths: [CMakeLists.txt, CMakeModules/, Makefile, build-scripts/, .github/workflows/]
+    purpose: Build, validation, packaging, and continuous integration contracts.
+    instructions: build-scripts/AGENTS.md
+    validation_ids: [cmake-configure]
+    boundaries:
+      - Actual build definitions override explanatory documentation.
+  - id: governance
+    paths:
+      - AGENTS.md
+      - CONTRIBUTING.md
+      - GOVERNANCE.md
+      - OWNERSHIP.md
+      - REPOSITORY_SETTINGS.md
+      - ai/repository-settings.target.yml
+      - ai/repository-settings.target.schema.json
+      - .github/dependabot.yml
+      - .github/pull_request_template.md
+      - .github/workflows/validate-github-config.yml
+    purpose: Contribution, responsibility, and repository governance policy.
+    instructions: AGENTS.md
+    validation_ids: [agent-context, governance-audit]
+    boundaries:
+      - Every PR names a Responsible human.
+      - Tracked targets never prove that an administrator setting is active.
+      - One Responsible human is sufficient; do not enable an approval gate that locks the sole maintainer's own pull requests.

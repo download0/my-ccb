@@ -1,0 +1,165 @@
+cmake_minimum_required(VERSION 3.22)
+
+# Output libmain.so; SDL3 dlsym's SDL_main from it
+# (CataclysmDDA.java::getMainSharedObject).
+project(cataclysm-android LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+get_filename_component(CATA_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.."
+                       ABSOLUTE)
+
+set(TILES ON)
+set(DYNAMIC_LINKING ON)
+
+find_package(SDL3 CONFIG REQUIRED)
+find_package(SDL3_image CONFIG REQUIRED)
+find_package(SDL3_ttf CONFIG REQUIRED)
+find_package(SDL3_mixer CONFIG REQUIRED)
+
+# Prefab AARs expose <SDL3/SDL.h> only; CDDA legacy bare <SDL_*.h> matches the
+# pkg-config sdl3 desktop layout, so also add each SDL3 subdir to -I.
+set(_sdl3_subdir_inc "")
+foreach(lib SDL3 SDL3_image SDL3_ttf SDL3_mixer)
+  foreach(tgt ${lib}::${lib} ${lib}::${lib}-shared
+                  ${lib}::${lib}-Headers ${lib}::Headers)
+    if(TARGET ${tgt})
+      get_target_property(inc ${tgt} INTERFACE_INCLUDE_DIRECTORIES)
+      if(inc)
+        foreach(dir IN LISTS inc)
+          if(IS_DIRECTORY "${dir}/SDL3")
+            list(APPEND _sdl3_subdir_inc "${dir}/SDL3")
+          endif()
+        endforeach()
+      endif()
+    endif()
+  endforeach()
+endforeach()
+list(REMOVE_DUPLICATES _sdl3_subdir_inc)
+
+add_subdirectory(${CATA_REPO_ROOT}/src/third-party third-party)
+
+file(GLOB CATA_SOURCES CONFIGURE_DEPENDS ${CATA_REPO_ROOT}/src/*.cpp
+     ${CATA_REPO_ROOT}/src/cata_allocator_c.c)
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+file(GLOB_RECURSE BUILTIN_MODINFO CONFIGURE_DEPENDS
+     ${CATA_REPO_ROOT}/data/mods/**/modinfo.json)
+set(BUILTIN_MODS_HEADER ${CMAKE_CURRENT_BINARY_DIR}/builtin_mods_generated.h)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} ${CATA_REPO_ROOT}/tools/generate_builtin_mods.py
+          --source ${CATA_REPO_ROOT}/data/mods
+          --output ${BUILTIN_MODS_HEADER}
+  RESULT_VARIABLE BUILTIN_MODS_RESULT
+  WORKING_DIRECTORY ${CATA_REPO_ROOT})
+if(NOT BUILTIN_MODS_RESULT STREQUAL "0")
+  message(FATAL_ERROR "Failed to generate the built-in mod manifest")
+endif()
+add_custom_command(
+  OUTPUT ${BUILTIN_MODS_HEADER}
+  COMMAND ${Python3_EXECUTABLE} ${CATA_REPO_ROOT}/tools/generate_builtin_mods.py
+          --source ${CATA_REPO_ROOT}/data/mods
+          --output ${BUILTIN_MODS_HEADER}
+  DEPENDS ${CATA_REPO_ROOT}/tools/generate_builtin_mods.py ${BUILTIN_MODINFO}
+  WORKING_DIRECTORY ${CATA_REPO_ROOT}
+  VERBATIM)
+add_custom_target(builtin_mod_manifest DEPENDS ${BUILTIN_MODS_HEADER})
+
+option(CCB_ANDROID_NEW_UI
+       "Enable the opt-in Android touch UI and customizable HUD" OFF)
+option(CATA_ENABLE_LUA_PLATFORM "Enable the Lua-first Platform runtime" ON)
+
+set(
+  LUA_PLATFORM_ENABLED_SOURCES
+  ${CATA_REPO_ROOT}/src/lua_platform_mapgen_dispatch.cpp
+  ${CATA_REPO_ROOT}/src/lua_platform_snapshots.cpp
+  ${CATA_REPO_ROOT}/src/lua_platform_registry.cpp
+  ${CATA_REPO_ROOT}/src/lua_platform_services.cpp
+  ${CATA_REPO_ROOT}/src/lua_platform_state.cpp
+  ${CATA_REPO_ROOT}/src/lua_platform_values.cpp)
+if(CATA_ENABLE_LUA_PLATFORM)
+  add_subdirectory(${CATA_REPO_ROOT}/src/lua lua)
+  add_subdirectory(${CATA_REPO_ROOT}/src/sol sol)
+  list(REMOVE_ITEM CATA_SOURCES
+       ${CATA_REPO_ROOT}/src/lua_platform_disabled.cpp)
+else()
+  list(REMOVE_ITEM CATA_SOURCES ${LUA_PLATFORM_ENABLED_SOURCES})
+endif()
+
+add_library(main SHARED ${CATA_SOURCES})
+add_dependencies(main builtin_mod_manifest)
+
+# Android always uses SDL3's Vulkan GPU backend when available, so every APK
+# needs SPIR-V shader artifacts. Release CI downloads and validates prebuilt
+# files; local builds generate them as part of the native build by default.
+option(CATA_ANDROID_PREBUILT_SHADERS
+       "Use precompiled Android SPIR-V shader artifacts" OFF)
+set(CATA_SHADERS_DIR ${CATA_REPO_ROOT}/data/shaders)
+set(CATA_ANDROID_SHADER_STAMP ${CATA_SHADERS_DIR}/build-spv.stamp)
+file(GLOB CATA_SHADER_SOURCES ${CATA_SHADERS_DIR}/*.frag
+     ${CATA_SHADERS_DIR}/*.vert)
+if(CATA_ANDROID_PREBUILT_SHADERS)
+  foreach(shader ${CATA_SHADER_SOURCES})
+    set(shader_spv "${shader}.spv")
+    if(NOT EXISTS "${shader_spv}")
+      message(FATAL_ERROR "Precompiled Android shader is missing: ${shader_spv}")
+    endif()
+    file(SIZE "${shader_spv}" shader_spv_size)
+    if(shader_spv_size EQUAL 0)
+      message(FATAL_ERROR "Precompiled Android shader is empty: ${shader_spv}")
+    endif()
+  endforeach()
+  message(STATUS "Using precompiled Android SPIR-V shader artifacts")
+else()
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_custom_command(
+    OUTPUT ${CATA_ANDROID_SHADER_STAMP}
+    COMMAND
+      ${Python3_EXECUTABLE} ${CATA_REPO_ROOT}/tools/build_shaders.py --shader-dir
+      ${CATA_SHADERS_DIR} --formats spv --stamp ${CATA_ANDROID_SHADER_STAMP}
+    WORKING_DIRECTORY ${CATA_REPO_ROOT}
+    DEPENDS ${CATA_SHADER_SOURCES} ${CATA_REPO_ROOT}/tools/build_shaders.py
+    COMMENT "Compiling Android SPIR-V shader artifacts")
+  add_custom_target(compile_android_shaders ALL
+                    DEPENDS ${CATA_ANDROID_SHADER_STAMP})
+  add_dependencies(main compile_android_shaders)
+endif()
+
+target_include_directories(
+  main PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CATA_REPO_ROOT}/src
+               ${CATA_REPO_ROOT}/src/third-party
+               ${_sdl3_subdir_inc})
+
+target_compile_definitions(
+  main
+  PRIVATE TILES
+          SDL_SOUND
+          CCB_ANDROID_NEW_UI=$<BOOL:${CCB_ANDROID_NEW_UI}>
+          CATA_ENABLE_LUA_PLATFORM=$<BOOL:${CATA_ENABLE_LUA_PLATFORM}>
+          CMAKE
+          BACKTRACE
+          LOCALIZE
+          ZSTD_STATIC_LINKING_ONLY
+          ZSTD_DISABLE_ASM)
+
+target_compile_options(main PRIVATE -fsigned-char -Wall -Wextra)
+
+target_link_libraries(
+  main
+  PRIVATE third-party
+          SDL3::SDL3
+          SDL3_image::SDL3_image
+          SDL3_ttf::SDL3_ttf
+          SDL3_mixer::SDL3_mixer
+          log
+          GLESv2
+          GLESv1_CM
+          z)
+
+if(CATA_ENABLE_LUA_PLATFORM)
+  target_link_libraries(main PRIVATE libsol)
+endif()

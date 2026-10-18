@@ -1,0 +1,491 @@
+"""SDK snapshots and author diagnostics with an optional real LuaLS gate."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+try:
+    from . import mod_sdk
+except ImportError:
+    import mod_sdk
+
+ROOT = Path(__file__).resolve().parents[2]
+DECLARATIONS = '''---@meta
+---@class CcbPlatformV1
+---@field runtime Runtime
+---@class Runtime
+local Runtime = {}
+---@param name string
+function Runtime.hello(name) end
+---@type CcbPlatformV1
+local ccb = {}
+return ccb
+'''
+
+
+class ModSdkTest(unittest.TestCase):
+    def make_sdk(
+        self, root: Path, name: str, text: str = DECLARATIONS,
+    ) -> Path:
+        source = root / (name + ".d.lua")
+        source.write_text(text, encoding="utf-8")
+        mod = root / name
+        mod.mkdir()
+        mod_sdk.write_editor_files(mod, source)
+        return mod
+
+    def test_initialize_existing_mod_preserves_author_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "target.d.lua"
+            source.write_text(DECLARATIONS, encoding="utf-8")
+            mod = root / "existing"
+            mod.mkdir()
+            main = mod / "main.lua"
+            main.write_text('error("do not execute")', encoding="utf-8")
+            before = main.read_bytes()
+            metadata = mod_sdk.initialize_sdk(mod, source)
+            self.assertEqual(metadata, mod_sdk.read_sdk(mod)[0])
+            self.assertEqual(main.read_bytes(), before)
+            self.assertEqual(
+                (mod / ".ccb-sdk/ccb.lua").read_bytes(),
+                source.read_bytes())
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                mod_sdk.initialize_sdk(mod, source)
+
+    def test_initialize_refuses_existing_config_and_cleans_partial_sdk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "target.d.lua"
+            source.write_text(DECLARATIONS, encoding="utf-8")
+            mod = root / "existing"
+            mod.mkdir()
+            config = mod / ".luarc.json"
+            config.write_text("author settings", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                mod_sdk.initialize_sdk(mod, source)
+            self.assertFalse((mod / ".ccb-sdk").exists())
+            self.assertEqual(config.read_text(), "author settings")
+            config.unlink()
+            original_open = Path.open
+
+            def raced_config(path, mode="r", *args, **kwargs):
+                if path == config and mode == "xb":
+                    with original_open(
+                            config, "w", encoding="utf-8") as stream:
+                        stream.write("concurrent author settings")
+                return original_open(path, mode, *args, **kwargs)
+
+            with patch.object(Path, "open", raced_config):
+                with self.assertRaises(FileExistsError):
+                    mod_sdk.initialize_sdk(mod, source)
+            self.assertFalse((mod / ".ccb-sdk").exists())
+            self.assertEqual(config.read_text(), "concurrent author settings")
+
+    def test_snapshot_survives_source_changes_and_project_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mod = self.make_sdk(root, "before")
+            (root / "before.d.lua").write_text("changed", encoding="utf-8")
+            moved = root / "moved"
+            shutil.move(mod, moved)
+            metadata, text = mod_sdk.read_sdk(moved)
+            self.assertEqual(text, DECLARATIONS)
+            self.assertEqual(metadata["platform_version"], 1)
+            settings = json.loads((moved / ".luarc.json").read_text())
+            library = moved / settings["workspace.library"][0]
+            self.assertTrue(library.is_dir())
+
+    def test_tampered_declarations_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.make_sdk(Path(directory), "example")
+            (mod / ".ccb-sdk/ccb.lua").write_text(
+                "tampered", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                mod_sdk.read_sdk(mod)
+
+    def test_compare_reports_types_removals_and_additions_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before = self.make_sdk(root, "before")
+            after = self.make_sdk(root, "after", DECLARATIONS.replace(
+                "---@param name string", "---@param name integer"
+            ).replace(
+                "---@field runtime Runtime", "---@field service Runtime"
+            ))
+            saved = (before / ".ccb-sdk/ccb.lua").read_bytes()
+            report = mod_sdk.compare_sdks(before, after)
+            self.assertIn("Runtime.hello", report["changed"])
+            self.assertEqual(
+                report["removed"], ["CcbPlatformV1.runtime"]
+            )
+            self.assertEqual(report["added"], ["CcbPlatformV1.service"])
+            self.assertEqual((before / ".ccb-sdk/ccb.lua").read_bytes(), saved)
+
+    def test_compare_release_needs_no_second_scaffold_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mod = self.make_sdk(root, "installed")
+            release = root / "target-game.d.lua"
+            release.write_text(DECLARATIONS.replace(
+                "---@param name string", "---@param name integer"
+            ), encoding="utf-8")
+            paths = [mod / ".ccb-sdk/ccb.lua", mod / ".ccb-sdk/version.json",
+                     mod / ".luarc.json", release]
+            before = {path: path.read_bytes() for path in paths}
+            report = mod_sdk.compare_release(mod, release)
+            self.assertIn("Runtime.hello", report["changed"])
+            self.assertEqual(
+                report["target_declarations"], str(release.resolve()))
+            self.assertEqual(report["new"]["declarations_sha256"],
+                             mod_sdk.digest(before[release]))
+            self.assertEqual(
+                {path: path.read_bytes() for path in paths}, before)
+            self.assertFalse((root / ".ccb-sdk").exists())
+
+    def test_compare_reports_multiline_alias_members_without_mixing_aliases(
+            self):
+        aliases = ("\n---@alias EquipmentError\n"
+                   "---| 'stale_runtime'\n---| 'wrong_holder'\n"
+                   "\n---@alias Operation\n---| 'wield'\n---| 'wear'\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before = self.make_sdk(root, "before", DECLARATIONS + aliases)
+            after = self.make_sdk(
+                root,
+                "after",
+                DECLARATIONS +
+                aliases.replace(
+                    "---| 'wrong_holder'",
+                    "---| 'invalid_holder'"))
+            report = mod_sdk.compare_sdks(before, after)
+            self.assertEqual(set(report["changed"]), {"alias EquipmentError"})
+            difference = report["changed"]["alias EquipmentError"]
+            self.assertIn("---| 'wrong_holder'", difference["before"])
+            self.assertIn("---| 'invalid_holder'", difference["after"])
+            self.assertNotIn("---| 'wear'", difference["after"])
+
+    def test_compare_release_rejects_invalid_target_and_tampered_sdk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mod = self.make_sdk(root, "installed")
+            release = root / "target-game.d.lua"
+            release.write_text("return {}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Platform v1"):
+                mod_sdk.compare_release(mod, release)
+            release.write_text(DECLARATIONS, encoding="utf-8")
+            (mod / ".ccb-sdk/ccb.lua").write_text("changed", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                mod_sdk.compare_release(mod, release)
+
+    def test_sdk_metadata_must_identify_the_supported_platform_and_lua(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.make_sdk(Path(directory), "example")
+            metadata_path = mod / ".ccb-sdk/version.json"
+            original = json.loads(metadata_path.read_text(encoding="utf-8"))
+            for key, value in (("schema_version", True),
+                               ("platform_version", True),
+                               ("platform_version", 5), ("lua_version", "5.3"),
+                               ("lua_version", None)):
+                with self.subTest(key=key, value=value):
+                    changed = dict(original, **{key: value})
+                    metadata_path.write_text(
+                        json.dumps(changed), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "unsupported"):
+                        mod_sdk.read_sdk(mod)
+
+    def test_source_line_movement_does_not_change_signatures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before = self.make_sdk(root, "before")
+            after = self.make_sdk(root, "after", "-- comment\n" + DECLARATIONS)
+            report = mod_sdk.compare_sdks(before, after)
+            self.assertEqual(report["changed"], {})
+            self.assertNotEqual(report["old"]["declarations_sha256"],
+                                report["new"]["declarations_sha256"])
+
+    def test_partial_diagnostics_cannot_hide_a_checker_signal_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.make_sdk(Path(directory), "example")
+
+            def crash(command, **kwargs):
+                log = next(x.split("=", 1)[1] for x in command
+                           if x.startswith("--logpath="))
+                report = {"file:///example.lua": [{
+                    "range": {"start": {"line": 0, "character": 0}},
+                    "message": "partial diagnostic",
+                }]}
+                (Path(log) / "check.json").write_text(
+                    json.dumps(report), encoding="utf-8")
+                return subprocess.CompletedProcess(command, -11, "", "crash")
+
+            with patch.object(mod_sdk.subprocess, "run", side_effect=crash):
+                with self.assertRaisesRegex(RuntimeError, "exited -11"):
+                    mod_sdk.check_mod(mod, "luals")
+
+    def test_malformed_diagnostic_has_a_report_error_instead_of_a_traceback(
+            self):
+        cases = [None, [None], [{"message": "missing location"}],
+                 [{"message": "bad position", "range": {
+                     "start": {"line": True, "character": 0}}}]]
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.make_sdk(Path(directory), "example")
+            for entries in cases:
+                def malformed(command, **kwargs):
+                    log = next(x.split("=", 1)[1] for x in command
+                               if x.startswith("--logpath="))
+                    (Path(log) / "check.json").write_text(json.dumps(
+                        {"file:///example.lua": entries}), encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with self.subTest(entries=entries), patch.object(
+                        mod_sdk.subprocess, "run", side_effect=malformed):
+                    with self.assertRaisesRegex(
+                            ValueError, "LuaLS report for"):
+                        mod_sdk.check_mod(mod, "luals")
+
+    def test_checker_crash_is_not_a_clean_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.make_sdk(Path(directory), "example")
+
+            def crash(command, **kwargs):
+                log = next(x.split("=", 1)[1] for x in command
+                           if x.startswith("--logpath="))
+                (Path(log) / "check.json").write_text("[]", encoding="utf-8")
+                return subprocess.CompletedProcess(command, -11, "", "crash")
+
+            with patch.object(mod_sdk.subprocess, "run", side_effect=crash):
+                with self.assertRaisesRegex(RuntimeError, "exited -11"):
+                    mod_sdk.check_mod(mod, "luals")
+
+
+@unittest.skipUnless(
+    os.environ.get("CCB_LUALS"), "set CCB_LUALS for editor gate"
+)
+class LuaLanguageServerIntegrationTest(unittest.TestCase):
+    def scaffold(self, root: Path, template: str) -> Path:
+        mod = root / template
+        subprocess.run(
+            [sys.executable, str(ROOT / "tools/create_lua_mod.py"),
+             str(mod), "--template", template], check=True,
+            capture_output=True, text=True,
+        )
+        return mod
+
+    def test_effect_snapshot_and_variable_services_have_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "semantic_query.lua"
+            source.write_text('''local ccb = require("ccb")
+---@param character GameHandle
+local function inspect(character)
+    ---@type CcbVariablesApi
+    local variables = ccb.services.variables
+    local selected = variables.resolve({}, character, "u", "selected")
+    local effect = ccb.services.effects.get(
+        character, ccb.services.types.id("effect", "bleed"))
+    if effect.ok then
+        ---@type CcbEffectSnapshot
+        local snapshot = assert(effect.value)
+        return snapshot.intensity, selected.value
+    end
+    return 0, nil
+end
+return inspect
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_day_predicate_has_boolean_editor_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            (mod / "day.lua").write_text('''local ccb = require("ccb")
+---@return boolean
+return function()
+    local services = ccb.services
+    return not services.gameplay.environment.is_night()
+end
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_native_variable_copy_has_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "copy.lua"
+            source.write_text('''local ccb = require("ccb")
+---@param owner GameHandle
+return function(owner)
+    local result = ccb.services.variables.copy(nil, "global", owner, "local")
+    if result.ok then
+        local metadata = assert(result.value)
+        return metadata.source_exists, metadata.destination_existed
+    end
+end
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_interaction_input_uses_native_options_and_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "input.lua"
+            source.write_text('''local ccb = require("ccb")
+local result = ccb.services.interaction.input_text("Title", {
+    default = "original", identifier = "history", width = 40})
+---@type boolean
+local accepted = result.accepted
+---@type string
+local text = result.value
+return accepted, result.cancelled, text
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_technique_choice_has_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "choose_technique.lua"
+            source.write_text('''local ccb = require("ccb")
+---@param attacker GameHandle
+---@param target GameHandle
+return function(attacker, target)
+    local result = ccb.services.characters.choose_technique(
+        attacker, target,
+        {critical = true, blacklist = {"tech_base_headbutt"}})
+    if result.ok then
+        local choice = assert(result.value)
+        return choice.found, choice.technique.value, choice.contact_area
+    end
+end
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_technique_definition_has_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "technique.lua"
+            source.write_text('''local ccb = require("ccb")
+local definition = ccb.services.martial_arts.technique_definition(
+    ccb.services.types.id("martial_art_technique", "tech_base_headbutt"))
+---@type string
+local short = definition.flavor_description
+for _, id in ipairs(definition.attack_vectors.items) do
+    assert(id.kind == "attack_vector")
+end
+return short, definition.description
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_gameplay_option_snapshot_has_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "options.lua"
+            source.write_text('''local ccb = require("ccb")
+local option = ccb.services.gameplay.options.get("USE_LANG")
+if option ~= nil then
+    ---@type CcbGameplayOptionSnapshot
+    local snapshot = option
+    ---@type string
+    local value = snapshot.value
+    return value, snapshot.prerequisite_satisfied
+end
+return ccb.services.gameplay.options.value("USE_LANG")
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_complete_body_parts_have_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "body_parts.lua"
+            source.write_text('''local ccb = require("ccb")
+---@param character GameHandle
+return function(character)
+    local result = ccb.services.characters.body_parts(character)
+    if result.ok then
+        for _, part in ipairs(assert(result.value)) do
+            ---@type GameId
+            local id = part
+            ccb.services.effects.remove(
+                character, ccb.services.types.id("effect", "bleed"), id)
+        end
+    end
+end
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_weighted_body_part_has_editor_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            source = mod / "weighted_part.lua"
+            source.write_text('''local ccb = require("ccb")
+---@param character GameHandle
+return function(character)
+    ---@type GameHandle
+    local player = ccb.services.characters.avatar()
+    local result = ccb.services.characters.random_body_part(player, true)
+    if result.ok then
+        ---@type GameId
+        local part = assert(result.value)
+        return ccb.services.effects.remove(
+            character, ccb.services.types.id("effect", "bleed"), part)
+    end
+    return result
+end
+''', encoding="utf-8")
+            self.assertEqual(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), [])
+
+    def test_both_templates_are_clean_in_real_language_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for template in ("minimal", "complete"):
+                with self.subTest(template=template):
+                    mod = self.scaffold(Path(directory), template)
+                    self.assertEqual(
+                        mod_sdk.check_mod(mod, os.environ["CCB_LUALS"]), []
+                    )
+
+    def test_real_errors_have_file_line_expected_type_and_api_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mod = self.scaffold(Path(directory), "minimal")
+            invalid = mod / "invalid.lua"
+            invalid.write_text('''local ccb = require("ccb")
+ccb.runtime.handler("bad", "not a function")
+ccb.runtime.nonexistent_api()
+ccb.presentation.confirm(123)
+ccb.runtime.handler()
+''', encoding="utf-8")
+            report = "\n".join(
+                mod_sdk.check_mod(mod, os.environ["CCB_LUALS"])
+            )
+            self.assertIn(str(invalid) + ":2:", report)
+            self.assertIn("param-type-mismatch", report)
+            self.assertIn("fun(payload: any):any", report)
+            self.assertIn(str(invalid) + ":3:", report)
+            self.assertIn("nonexistent_api", report)
+            self.assertIn(str(invalid) + ":5:", report)
+            self.assertIn("missing-parameter", report)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tools/lua_api/mod_sdk.py"),
+                 "check", str(mod), "--language-server",
+                 os.environ["CCB_LUALS"]],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

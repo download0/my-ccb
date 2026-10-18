@@ -1,0 +1,285 @@
+#include <initializer_list>
+#include <string>
+#include <vector>
+
+#include "activity_actor_definitions.h"
+#include "butchery.h"
+#include "calendar.h"
+#include "cata_catch.h"
+#include "character.h"
+#include "character_attire.h"
+#include "coordinates.h"
+#include "item.h"
+#include "item_group.h"
+#include "item_location.h"
+#include "map.h"
+#include "map_scale_constants.h"
+#include "map_selector.h"
+#include "monster.h"
+#include "options_helpers.h"
+#include "player_activity.h"
+#include "player_helpers.h"
+#include "point.h"
+#include "proficiency.h"
+#include "type_id.h"
+
+static const item_group_id
+Item_spawn_data_cattle_sample_single( "cattle_sample_single" );
+
+static const itype_id itype_debug_backpack( "debug_backpack" );
+static const itype_id itype_down_feather( "down_feather" );
+static const itype_id itype_fake_lift_light( "fake_lift_light" );
+static const itype_id itype_hacksaw( "hacksaw" );
+static const itype_id itype_knife_combat( "knife_combat" );
+static const itype_id itype_plastic_sheet( "plastic_sheet" );
+static const itype_id itype_rope_30( "rope_30" );
+static const itype_id itype_scalpel( "scalpel" );
+
+static const mtype_id mon_chicken( "mon_chicken" );
+static const mtype_id mon_civilian_panic( "mon_civilian_panic" );
+static const mtype_id mon_deer( "mon_deer" );
+static const mtype_id mon_feral_human_pipe( "mon_feral_human_pipe" );
+static const mtype_id mon_human( "mon_human" );
+static const mtype_id mon_mutant_antler( "mon_mutant_antler" );
+static const mtype_id mon_mutant_experimental( "mon_mutant_experimental" );
+static const mtype_id mon_test_CBM( "mon_test_CBM" );
+static const mtype_id mon_test_bovine( "mon_test_bovine" );
+static const mtype_id mon_zombie( "mon_zombie" );
+
+static const proficiency_id proficiency_prof_dissect_humans( "prof_dissect_humans" );
+static const proficiency_id proficiency_prof_physiology( "prof_physiology" );
+
+static const skill_id skill_firstaid( "firstaid" );
+static const skill_id skill_survival( "survival" );
+
+static const int max_iters = 1000;
+static constexpr tripoint_bub_ms mon_pos( HALF_MAPSIZE_X - 1, HALF_MAPSIZE_Y, 0 );
+
+static void butcher_mon( const mtype_id &monid, butcher_type butchery_type, int *cbm_count,
+                         int *sample_count, int *other_count )
+{
+    item scalpel( itype_scalpel );
+    Character &u = get_player_character();
+    map &here = get_map();
+    const tripoint_abs_ms orig_pos = u.pos_abs();
+    for( int i = 0; i < max_iters; i++ ) {
+        clear_character( u, true );
+        u.set_skill_level( skill_firstaid, 10 );
+        u.set_skill_level( skill_survival, 10 );
+        u.wield( scalpel );
+        monster cow( monid, mon_pos );
+        const tripoint_bub_ms cow_loc = cow.pos_bub();
+        cow.die( &here, nullptr );
+        u.move_to( cow.pos_abs() );
+
+        item_location loc = item_location( map_cursor( u.pos_abs() ), &*here.i_at( cow_loc ).begin() );
+        butchery_data bd( loc, butchery_type );
+        butchery_activity_actor act( bd );
+        act.calculate_butchery_data( u, bd );
+        destroy_the_carcass( bd, u );
+        for( const item &it : here.i_at( cow_loc ) ) {
+            if( it.is_bionic() ) {
+                ( *cbm_count )++;
+            } else if( item_group::group_contains_item( Item_spawn_data_cattle_sample_single,
+                       it.typeId() ) ) {
+                ( *sample_count )++;
+            } else {
+                ( *other_count )++;
+            }
+        }
+        here.i_clear( cow_loc );
+        u.move_to( orig_pos );
+    }
+}
+
+TEST_CASE( "Harvest_drops_from_dissecting_corpse", "[harvest]" )
+{
+    SECTION( "Mutagen samples" ) {
+        int sample_count = 0;
+        int cbm_count = 0;
+        int other_count = 0;
+        butcher_mon( mon_test_bovine, butcher_type::DISSECT, &cbm_count, &sample_count, &other_count );
+        CHECK( other_count > 0 );
+        CHECK( cbm_count == 0 );
+        CHECK( sample_count > 0 );
+    }
+
+    SECTION( "CBMs" ) {
+        int sample_count = 0;
+        int cbm_count = 0;
+        int other_count = 0;
+        butcher_mon( mon_test_CBM, butcher_type::DISSECT, &cbm_count, &sample_count, &other_count );
+        CHECK( other_count > 0 );
+        CHECK( cbm_count > 0 );
+        CHECK( sample_count == 0 );
+    }
+}
+
+TEST_CASE( "zombie_corpses_do_not_trigger_butchery_empathy", "[harvest][butchery]" )
+{
+    Character &u = get_player_character();
+    clear_character( u, true );
+
+    REQUIRE( u.empathizes_with_monster( mon_civilian_panic ) );
+    CHECK( character_has_butchery_empathy( u, mon_civilian_panic ) );
+
+    // Keep general species empathy intact; only butchery exempts zombified corpses.
+    REQUIRE( u.empathizes_with_monster( mon_zombie ) );
+    CHECK_FALSE( character_has_butchery_empathy( u, mon_zombie ) );
+
+    // NPC corpses use the null monster id and remain human for butchery purposes.
+    CHECK( character_has_butchery_empathy( u, mtype_id::NULL_ID() ) );
+}
+
+TEST_CASE( "human_autopsy_proficiency_from_dissection", "[harvest][butchery]" )
+{
+    const override_option training_speed( "PROFICIENCY_TRAINING_SPEED", "1" );
+    Character &u = get_player_character();
+    map &here = get_map();
+    const tripoint_abs_ms orig_pos = u.pos_abs();
+
+    const auto harvest_progress = [&]( const mtype_id & monid, bool has_prerequisite,
+    butcher_type action = butcher_type::DISSECT, bool almost_learned = false ) {
+        CAPTURE( monid, has_prerequisite, action, almost_learned );
+        clear_character( u, true );
+        u.set_skill_level( skill_firstaid, 10 );
+        u.set_skill_level( skill_survival, 10 );
+        u.set_focus( 100 );
+        item scalpel( itype_scalpel );
+        REQUIRE( u.wield( scalpel ) );
+        if( has_prerequisite ) {
+            u.add_proficiency( proficiency_prof_physiology, false, true );
+        }
+        if( almost_learned ) {
+            u.set_proficiency_practice( proficiency_prof_dissect_humans,
+                                        proficiency_prof_dissect_humans->time_to_learn() - 1_seconds );
+        }
+        REQUIRE_FALSE( u.has_proficiency( proficiency_prof_dissect_humans ) );
+
+        here.i_clear( mon_pos );
+        u.move_to( here.get_abs( mon_pos ) );
+        item_location loc = here.add_item_or_charges_ret_loc( mon_pos, item::make_corpse( monid ) );
+        REQUIRE( loc );
+        butchery_data bd( loc, action );
+        butchery_activity_actor act( bd );
+        act.calculate_butchery_data( u, bd );
+        destroy_the_carcass( bd, u );
+        CHECK_FALSE( loc );
+        CHECK( u.has_proficiency( proficiency_prof_dissect_humans ) == almost_learned );
+
+        const float progress = u.get_proficiency_practice( proficiency_prof_dissect_humans );
+        here.i_clear( mon_pos );
+        u.move_to( orig_pos );
+        return progress;
+    };
+
+    for( const mtype_id &monid : {
+             mon_human, mon_civilian_panic, mon_feral_human_pipe,
+             mon_mutant_experimental, mon_mutant_antler
+         } ) {
+        CAPTURE( monid );
+        CHECK( harvest_progress( monid, true ) > 0.0f );
+        CHECK( harvest_progress( monid, true, butcher_type::DISSECT, true ) == 1.0f );
+    }
+    CHECK( harvest_progress( mon_zombie, true ) == 0.0f );
+    CHECK( harvest_progress( mon_deer, true ) == 0.0f );
+    CHECK( harvest_progress( mon_human, false ) == 0.0f );
+    CHECK( harvest_progress( mon_human, true, butcher_type::QUICK ) == 0.0f );
+}
+
+static void do_butchery_timing( int expected_turns, butcher_type butchery_type,
+                                int skill, mtype_id mon_type )
+{
+    Character &u = get_player_character();
+    map &here = get_map();
+    const tripoint_abs_ms orig_pos = u.pos_abs();
+    clear_character( u, true );
+    u.set_skill_level( skill_firstaid, skill );
+    u.set_skill_level( skill_survival, skill );
+    u.worn.wear_item( u, item( itype_debug_backpack ), false, false );
+    u.i_add( item( itype_fake_lift_light ) );
+    u.i_add( item( itype_hacksaw ) );
+    u.i_add( item( itype_knife_combat ) );
+    u.i_add( item( itype_plastic_sheet ) );
+    u.i_add( item( itype_rope_30 ) );
+    monster butcherable_animal( mon_type, mon_pos );
+    const tripoint_bub_ms animal_loc = butcherable_animal.pos_bub();
+    const tripoint_abs_ms animal_loc_abs = butcherable_animal.pos_abs();
+    here.i_clear( animal_loc );
+    butcherable_animal.die( &here, nullptr );
+    u.move_to( animal_loc_abs );
+    REQUIRE( u.pos_abs() == animal_loc_abs );
+    CAPTURE( here.i_at( animal_loc ) );
+    item_location loc = item_location( map_cursor( u.pos_abs() ), &*here.i_at( animal_loc ).begin() );
+    butchery_data bd( loc, butchery_type );
+    butchery_activity_actor act( bd );
+    player_activity p_act{ act };
+    int turns_taken = 0;
+    while( p_act.moves_left > 0 ) {
+        p_act.do_turn( u );
+        turns_taken++;
+    }
+    CHECK( turns_taken > expected_turns * 0.9 );
+    CHECK( turns_taken < expected_turns * 1.1 );
+    here.i_clear( animal_loc );
+    u.move_to( orig_pos );
+}
+
+TEST_CASE( "butchery_speed", "[harvest]" )
+{
+    // Cleanwater Bomb intentionally uses the restored, faster butchery times.
+    do_butchery_timing( 87 * 60 + 30, butcher_type::FULL, 5, mon_deer );
+}
+
+// Regression test for #85877 / #85136: butchering birds with sub-gram harvest
+// items (down_feather weighs 10 mg) caused division by zero in the yield
+// calculation because to_gram() truncates sub-gram weights to 0.
+// On x86 this silently produces 0 feathers; on ARM64 it produces 333333 per tile.
+TEST_CASE( "butchery_sub_gram_harvest_items", "[harvest]" )
+{
+    Character &u = get_player_character();
+    map &here = get_map();
+    const tripoint_abs_ms orig_pos = u.pos_abs();
+
+    clear_character( u, true );
+    u.set_skill_level( skill_firstaid, 10 );
+    u.set_skill_level( skill_survival, 10 );
+    u.worn.wear_item( u, item( itype_debug_backpack ), false, false );
+    u.i_add( item( itype_knife_combat ) );
+
+    monster bird( mon_chicken, mon_pos );
+    const tripoint_bub_ms bird_loc = bird.pos_bub();
+    here.i_clear( bird_loc );
+    bird.die( &here, nullptr );
+    u.move_to( bird.pos_abs() );
+
+    item_location loc = item_location( map_cursor( u.pos_abs() ), &*here.i_at( bird_loc ).begin() );
+    butchery_data bd( loc, butcher_type::FULL );
+    butchery_activity_actor act( bd );
+    act.calculate_butchery_data( u, bd );
+    destroy_the_carcass( bd, u );
+
+    // Count down_feather charges on the butchery tile and all overflow tiles
+    int total_down_feathers = 0;
+    for( const tripoint_bub_ms &p : closest_points_first( bird_loc, 0, 3 ) ) {
+        for( const item &it : here.i_at( p ) ) {
+            if( it.typeId() == itype_down_feather ) {
+                total_down_feathers += it.count();
+            }
+        }
+    }
+
+    // Chicken is 2 kg, down_feather mass_ratio is 0.005, so 10g of feather material.
+    // Each down_feather weighs 10 mg, so the correct yield is around 500-1000
+    // (depending on skill multiplier which maxes at 1.0).
+    // Before the fix: 0 on x86 (negative roll from UB), 333333/tile on ARM64.
+    CAPTURE( total_down_feathers );
+    CHECK( total_down_feathers > 0 );
+    CHECK( total_down_feathers < 5000 );
+
+    // Clean up all tiles that might have overflow items
+    for( const tripoint_bub_ms &p : closest_points_first( bird_loc, 0, 3 ) ) {
+        here.i_clear( p );
+    }
+    u.move_to( orig_pos );
+}

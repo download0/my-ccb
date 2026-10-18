@@ -1,0 +1,798 @@
+#if CATA_ENABLE_LUA_PLATFORM
+
+#include "lua_platform_effects.h"
+
+extern "C" {
+#include <lua.h>
+}
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "bodypart.h"
+#include "calendar.h"
+#include "creature.h"
+#include "effect.h"
+#include "lua_platform_bindings_values.h"
+#include "lua_platform_handle.h"
+#include "type_id.h"
+
+namespace cata::lua_platform
+{
+
+namespace
+{
+
+constexpr int default_effect_limit = 64;
+constexpr int maximum_effect_limit = 256;
+constexpr std::size_t maximum_effect_relation_ids = 64;
+constexpr int maximum_effect_assignment_intensity = 1000000;
+constexpr int maximum_effect_intensity_delta = 1000;
+
+void require_id_kind( const script_game_id &id, const std::string &kind,
+                      const std::string &api_name )
+{
+    if( id.kind() != kind ) {
+        throw std::invalid_argument(
+            api_name + " requires GameId<" + kind + ">" );
+    }
+    if( !id.is_valid() ) {
+        throw std::invalid_argument(
+            api_name + " requires a valid GameId<" + kind + ">" );
+    }
+}
+
+int effect_limit( const sol::optional<int> &requested,
+                  const std::string &api_name )
+{
+    const int result = requested.value_or( default_effect_limit );
+    if( result < 0 ) {
+        throw std::invalid_argument(
+            api_name + " limit cannot be negative" );
+    }
+    return std::min( result, maximum_effect_limit );
+}
+
+std::optional<bodypart_id> effect_body_part(
+    const std::optional<script_game_id> &requested,
+    const std::string &api_name )
+{
+    if( !requested ) {
+        return std::nullopt;
+    }
+    require_id_kind( *requested, "body_part", api_name );
+    // Effects are keyed by registered body-part IDs, independently of the
+    // creature's current anatomy. Match native queries and mutations, including
+    // effects retained after a body-part change.
+    return bodypart_str_id( requested->value() ).id();
+}
+
+template<typename Id>
+sol::table typed_id_page(
+    sol::state_view lua, const std::vector<Id> &ids,
+    const std::string &kind )
+{
+    const std::size_t returned = std::min(
+                                     ids.size(),
+                                     maximum_effect_relation_ids );
+    sol::table items = lua.create_table(
+                           static_cast<int>( returned ), 0 );
+    for( std::size_t index = 0; index < returned; ++index ) {
+        items[index + 1] =
+            script_game_id( kind, ids[index].str() );
+    }
+    sol::table result = lua.create_table();
+    result["items"] = std::move( items );
+    result["total"] = ids.size();
+    result["returned"] = returned;
+    result["truncated"] = returned < ids.size();
+    return result;
+}
+
+sol::table snapshot_effect(
+    sol::state_view lua, const effect &entry )
+{
+    const effect snapshot = entry;
+    sol::table result = lua.create_table();
+    result["id"] = script_game_id(
+                       "effect", snapshot.get_id().str() );
+    result["name"] = snapshot.disp_name();
+    result["description"] = snapshot.disp_desc();
+    result["short_description"] = snapshot.disp_short_desc();
+    result["mod_source"] = snapshot.disp_mod_source_info();
+    result["uses_body_part_description"] =
+        snapshot.use_part_descs();
+    result["duration"] = script_time_duration::from_native(
+                             snapshot.get_duration() );
+    result["maximum_duration"] =
+        script_time_duration::from_native(
+            snapshot.get_max_duration() );
+    result["start_time"] = script_time_point::from_native(
+                               snapshot.get_start_time() );
+    result["intensity"] = snapshot.get_intensity();
+    result["maximum_intensity"] = snapshot.get_max_intensity();
+    result["maximum_effective_intensity"] =
+        snapshot.get_max_effective_intensity();
+    result["effective_intensity"] =
+        snapshot.get_effective_intensity();
+    result["permanent"] = snapshot.is_permanent();
+    result["impairs_movement"] = snapshot.impairs_movement();
+    result["harmful_cough"] = snapshot.get_harmful_cough();
+    result["duration_add_percent"] =
+        snapshot.get_dur_add_perc();
+    result["intensity_add"] = snapshot.get_int_add_val();
+    result["intensity_duration"] =
+        script_time_duration::from_native(
+            snapshot.get_int_dur_factor() );
+
+    const bodypart_str_id body_part = snapshot.get_bp().id();
+    if( body_part.is_null() ) {
+        result["body_part"] = sol::nil;
+    } else {
+        result["body_part"] = script_game_id(
+                                  "body_part", body_part.str() );
+    }
+
+    sol::table resisted_by = lua.create_table();
+    resisted_by["mutations"] = typed_id_page(
+                                   lua, snapshot.get_resist_traits(),
+                                   "mutation" );
+    resisted_by["effects"] = typed_id_page(
+                                 lua, snapshot.get_resist_effects(),
+                                 "effect" );
+    result["resisted_by"] = std::move( resisted_by );
+    result["removes_effects"] = typed_id_page(
+                                    lua, snapshot.get_removes_effects(),
+                                    "effect" );
+    result["blocks_effects"] = typed_id_page(
+                                   lua, snapshot.get_blocks_effects(),
+                                   "effect" );
+    return result;
+}
+
+const effect *find_effect(
+    const Creature &creature, const efftype_id &id,
+    const std::optional<bodypart_id> &body_part )
+{
+    const std::vector<std::reference_wrapper<const effect>> effects =
+                creature.get_effects();
+    const auto found = std::find_if(
+                           effects.begin(), effects.end(),
+    [&id, &body_part]( const std::reference_wrapper<const effect> &candidate ) {
+        return candidate.get().get_id() == id &&
+               ( !body_part ||
+                 candidate.get().get_bp() == *body_part );
+    } );
+    return found == effects.end() ? nullptr : &found->get();
+}
+
+effect *find_effect(
+    Creature &creature, const efftype_id &id,
+    const std::optional<bodypart_id> &body_part )
+{
+    const effect *selected = find_effect(
+                                 static_cast<const Creature &>( creature ),
+                                 id, body_part );
+    return selected == nullptr ? nullptr :
+           &creature.get_effect( id, selected->get_bp() );
+}
+
+sol::table list_effects(
+    sol::this_state lua, const game_handle &handle,
+    const sol::optional<int> &requested_limit,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    const int limit = effect_limit(
+                          requested_limit, "services.effects.list" );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::vector<std::reference_wrapper<const effect>> effects =
+                creature->get_effects();
+    const std::size_t total = effects.size();
+    const std::size_t returned = std::min(
+                                     total,
+                                     static_cast<std::size_t>( limit ) );
+    std::vector<effect> snapshots;
+    snapshots.reserve( returned );
+    for( std::size_t index = 0; index < returned; ++index ) {
+        snapshots.push_back( effects[index].get() );
+    }
+    sol::table items = state.create_table(
+                           static_cast<int>( returned ), 0 );
+    for( std::size_t index = 0; index < returned; ++index ) {
+        items[index + 1] =
+            snapshot_effect( state, snapshots[index] );
+    }
+    sol::table value = state.create_table();
+    value["items"] = std::move( items );
+    value["total"] = total;
+    value["returned"] = returned;
+    value["limit"] = limit;
+    value["truncated"] = returned < total;
+    return make_game_value_result(
+               state, sol::make_object( state, std::move( value ) ) );
+}
+
+sol::table has_effect(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id,
+    const std::optional<script_game_id> &requested_body_part,
+    const std::optional<double> &requested_intensity,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.has" );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            requested_body_part,
+            "services.effects.has" );
+    if( requested_intensity &&
+        ( !std::isfinite( *requested_intensity ) ||
+          *requested_intensity < -1000000.0 ||
+          *requested_intensity > 1000000.0 ) ) {
+        throw std::invalid_argument(
+            "services.effects.has intensity must be finite and within -1000000..1000000" );
+    }
+    const efftype_id id( requested_id.value() );
+    const effect *entry = find_effect( *creature, id, body_part );
+    const bool present = entry != nullptr &&
+                         ( !requested_intensity ||
+                           entry->get_intensity() >= *requested_intensity );
+    return make_game_value_result(
+               state, sol::make_object( state, present ) );
+}
+
+sol::table get_effect(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id,
+    const std::optional<script_game_id> &requested_body_part,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.get" );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            requested_body_part,
+            "services.effects.get" );
+    const effect *entry = find_effect(
+                              *creature,
+                              efftype_id( requested_id.value() ),
+                              body_part );
+    if( entry == nullptr ) {
+        return make_game_error_result(
+        state, {
+            "not_found",
+            "The creature does not have the requested effect"
+        } );
+    }
+    return make_game_value_result(
+               state, sol::make_object(
+                   state, snapshot_effect( state, *entry ) ) );
+}
+
+struct effect_add_options {
+    std::optional<script_game_id> body_part;
+    bool permanent = false;
+    int intensity = 0;
+    bool force = false;
+};
+
+effect_add_options read_add_options(
+    const sol::optional<sol::table> &requested )
+{
+    effect_add_options result;
+    if( !requested ) {
+        return result;
+    }
+    for( const auto &entry : *requested ) {
+        const sol::object key_object = entry.first;
+        if( key_object.get_type() != sol::type::string ) {
+            throw std::invalid_argument(
+                "services.effects.add option keys must be strings" );
+        }
+        const std::string key = key_object.as<std::string>();
+        const sol::object value = entry.second;
+        if( key == "body_part" ) {
+            if( !value.is<script_game_id>() ) {
+                throw std::invalid_argument(
+                    "services.effects.add body_part must be a GameId" );
+            }
+            result.body_part = value.as<script_game_id>();
+        } else if( key == "permanent" ) {
+            if( !value.is<bool>() ) {
+                throw std::invalid_argument(
+                    "services.effects.add permanent must be a boolean" );
+            }
+            result.permanent = value.as<bool>();
+        } else if( key == "intensity" ) {
+            if( !value.is<lua_Integer>() ) {
+                throw std::invalid_argument(
+                    "services.effects.add intensity must be an integer" );
+            }
+            const lua_Integer intensity = value.as<lua_Integer>();
+            if( intensity < std::numeric_limits<int>::min() ||
+                intensity > std::numeric_limits<int>::max() ) {
+                throw std::invalid_argument(
+                    "services.effects.add intensity must fit a native int" );
+            }
+            result.intensity = static_cast<int>( intensity );
+        } else if( key == "force" ) {
+            if( !value.is<bool>() ) {
+                throw std::invalid_argument(
+                    "services.effects.add force must be a boolean" );
+            }
+            result.force = value.as<bool>();
+        } else {
+            throw std::invalid_argument(
+                "services.effects.add received unknown option '" +
+                key + "'" );
+        }
+    }
+    return result;
+}
+
+void validate_effect_duration(
+    const script_time_duration &duration,
+    const std::string &api_name, const bool allow_zero = false )
+{
+    const std::int64_t maximum =
+        to_turns<std::int64_t>( 365_days );
+    if( duration.turns() < ( allow_zero ? 0 : 1 ) ||
+        duration.turns() > maximum ) {
+        throw std::invalid_argument(
+            api_name + ( allow_zero ?
+                         " duration must be between zero turns and 365 days" :
+                         " duration must be between one turn and 365 days" ) );
+    }
+}
+
+sol::table add_effect(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id,
+    const script_time_duration &duration,
+    const sol::optional<sol::table> &requested_options,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.add" );
+    const std::int64_t duration_turns = duration.turns();
+    if( duration_turns < std::numeric_limits<int>::min() ||
+        duration_turns > std::numeric_limits<int>::max() ) {
+        throw std::invalid_argument(
+            "services.effects.add duration must fit native signed int turns" );
+    }
+    // Preserve negative and long durations within the native signed turn
+    // range; Creature/effect owns expiry and clamping.
+    const effect_add_options options =
+        read_add_options( requested_options );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            options.body_part,
+            "services.effects.add" );
+    const efftype_id id( requested_id.value() );
+    if( body_part ) {
+        creature->add_effect(
+            id, duration.to_native(), *body_part,
+            options.permanent, options.intensity,
+            options.force );
+    } else {
+        creature->add_effect(
+            id, duration.to_native(), options.permanent,
+            options.intensity, options.force );
+    }
+    const native_handle_result<Creature> after_add =
+        handle.resolve_creature( runtime_generation, world_generation );
+    if( !after_add ) {
+        return make_game_error_result( state, *after_add.error );
+    }
+    const effect *entry = find_effect(
+                              *after_add.value, id, body_part );
+    if( entry == nullptr ) {
+        return make_game_error_result(
+        state, {
+            "rejected",
+            "The creature rejected the requested effect"
+        } );
+    }
+    return make_game_value_result(
+               state, sol::make_object(
+                   state, snapshot_effect( state, *entry ) ) );
+}
+
+sol::table remove_effect(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id,
+    const std::optional<script_game_id> &requested_body_part,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.remove" );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            requested_body_part,
+            "services.effects.remove" );
+    const efftype_id id( requested_id.value() );
+    const bool removed = body_part ?
+                         creature->remove_effect( id, *body_part ) :
+                         creature->remove_effect( id );
+    return make_game_value_result(
+               state, sol::make_object( state, removed ) );
+}
+
+sol::table adjust_effect_intensity(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id, const std::int64_t requested_delta,
+    const std::optional<script_game_id> &requested_body_part,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.adjust_intensity" );
+    if( requested_delta < -maximum_effect_intensity_delta ||
+        requested_delta > maximum_effect_intensity_delta ) {
+        throw std::invalid_argument(
+            "services.effects.adjust_intensity delta must be within -1000..1000" );
+    }
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            requested_body_part,
+            "services.effects.adjust_intensity" );
+    const efftype_id id( requested_id.value() );
+    effect *entry = find_effect( *creature, id, body_part );
+    int before = 0;
+    int after = 0;
+    bool changed = false;
+    bool removed = false;
+    if( entry != nullptr ) {
+        before = entry->get_intensity();
+        const std::int64_t requested_after =
+            static_cast<std::int64_t>( before ) + requested_delta;
+        if( requested_after <= 0 ) {
+            const bodypart_id selected_body_part = entry->get_bp();
+            removed = creature->remove_effect( id, selected_body_part );
+            changed = removed;
+        } else {
+            entry->set_intensity( static_cast<int>( requested_after ) );
+            after = entry->get_intensity();
+            changed = after != before;
+            if( changed ) {
+                const efftype_id changed_id = entry->get_id();
+                const bodypart_id changed_body_part = entry->get_bp();
+                creature->notify_effect_int_change(
+                    changed_id, after, changed_body_part );
+            }
+        }
+        creature = resolve_exact_creature(
+                       handle, runtime_generation,
+                       world_generation, error );
+        if( creature == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+    }
+    sol::table value = state.create_table();
+    value["before"] = before;
+    value["after"] = after;
+    value["changed"] = changed;
+    value["removed"] = removed;
+    return make_game_value_result(
+               state, sol::make_object( state, std::move( value ) ) );
+}
+
+struct effect_update_options {
+    std::optional<script_game_id> body_part;
+    std::optional<script_time_duration> duration;
+    std::optional<int> intensity;
+    std::optional<bool> permanent;
+};
+
+effect_update_options read_update_options(
+    const sol::table &requested )
+{
+    effect_update_options result;
+    for( const auto &entry : requested ) {
+        const sol::object key_object = entry.first;
+        if( key_object.get_type() != sol::type::string ) {
+            throw std::invalid_argument(
+                "services.effects.update option keys must be strings" );
+        }
+        const std::string key = key_object.as<std::string>();
+        const sol::object value = entry.second;
+        if( key == "body_part" ) {
+            if( !value.is<script_game_id>() ) {
+                throw std::invalid_argument(
+                    "services.effects.update body_part must be a GameId" );
+            }
+            result.body_part = value.as<script_game_id>();
+        } else if( key == "duration" ) {
+            if( !value.is<script_time_duration>() ) {
+                throw std::invalid_argument(
+                    "services.effects.update duration must be a TimeDuration" );
+            }
+            const script_time_duration duration =
+                value.as<script_time_duration>();
+            validate_effect_duration(
+                duration, "services.effects.update" );
+            result.duration = duration;
+        } else if( key == "intensity" ) {
+            if( !value.is<lua_Integer>() ) {
+                throw std::invalid_argument(
+                    "services.effects.update intensity must be an integer" );
+            }
+            const lua_Integer intensity = value.as<lua_Integer>();
+            if( intensity < 1 ||
+                intensity > maximum_effect_assignment_intensity ) {
+                throw std::invalid_argument(
+                    "services.effects.update intensity is outside its limit" );
+            }
+            result.intensity = static_cast<int>( intensity );
+        } else if( key == "permanent" ) {
+            if( !value.is<bool>() ) {
+                throw std::invalid_argument(
+                    "services.effects.update permanent must be a boolean" );
+            }
+            result.permanent = value.as<bool>();
+        } else {
+            throw std::invalid_argument(
+                "services.effects.update received unknown option '" +
+                key + "'" );
+        }
+    }
+    return result;
+}
+
+sol::table update_effect(
+    sol::this_state lua, const game_handle &handle,
+    const script_game_id &requested_id,
+    const sol::table &requested_options,
+    const game_handle_runtime &runtime_generation,
+    const std::size_t world_generation )
+{
+    require_id_kind(
+        requested_id, "effect", "services.effects.update" );
+    const effect_update_options options =
+        read_update_options( requested_options );
+    sol::state_view state( lua );
+    std::optional<game_handle_error> error;
+    Creature *creature = resolve_exact_creature(
+                             handle, runtime_generation,
+                             world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    const std::optional<bodypart_id> body_part =
+        effect_body_part(
+            options.body_part,
+            "services.effects.update" );
+    effect *entry = find_effect(
+                        *creature,
+                        efftype_id( requested_id.value() ),
+                        body_part );
+    if( entry == nullptr ) {
+        return make_game_error_result(
+        state, {
+            "not_found",
+            "The creature does not have the requested effect"
+        } );
+    }
+    sol::table before = snapshot_effect( state, *entry );
+    creature = resolve_exact_creature(
+                   handle, runtime_generation,
+                   world_generation, error );
+    if( creature == nullptr ) {
+        return make_game_error_result( state, *error );
+    }
+    entry = find_effect(
+                *creature,
+                efftype_id( requested_id.value() ),
+                body_part );
+    if( entry == nullptr ) {
+        return make_game_error_result( state, {
+            "not_found", "The effect was removed while its state was captured"
+        } );
+    }
+    const int previous_intensity = entry->get_intensity();
+    if( options.duration ) {
+        entry->set_duration( options.duration->to_native() );
+    }
+    if( options.intensity ) {
+        entry->set_intensity( *options.intensity );
+    }
+    if( options.permanent ) {
+        if( *options.permanent ) {
+            entry->pause_effect();
+        } else {
+            entry->unpause_effect();
+        }
+    }
+    std::optional<effect> after_snapshot;
+    if( entry->get_intensity() != previous_intensity ) {
+        const efftype_id changed_id = entry->get_id();
+        const bodypart_id changed_body_part = entry->get_bp();
+        const int changed_intensity = entry->get_intensity();
+        creature->notify_effect_int_change(
+            changed_id, changed_intensity, changed_body_part );
+        creature = resolve_exact_creature(
+                       handle, runtime_generation,
+                       world_generation, error );
+        if( creature == nullptr ) {
+            return make_game_error_result( state, *error );
+        }
+        entry = find_effect(
+                    *creature, changed_id,
+                    std::optional<bodypart_id>( changed_body_part ) );
+    }
+    if( entry != nullptr ) {
+        after_snapshot = *entry;
+    }
+    sol::table value = state.create_table();
+    value["before"] = std::move( before );
+    if( after_snapshot ) {
+        value["after"] = snapshot_effect( state, *after_snapshot );
+    } else {
+        value["after"] = sol::nil;
+    }
+    return make_game_value_result(
+               state, sol::make_object( state, std::move( value ) ) );
+}
+
+} // namespace
+
+void install_effect_api(
+    sol::table &services,
+    const std::function<game_handle_runtime()> &current_runtime_generation,
+    const std::function<std::size_t()> &current_world_generation,
+    const std::function<void()> &require_read,
+    const std::function<void()> &require_write )
+{
+    sol::state_view lua( services.lua_state() );
+    sol::table effects = lua.create_table();
+    effects.set_function(
+        "list",
+        [current_runtime_generation, current_world_generation, require_read](
+            sol::this_state lua_state, const game_handle & handle,
+    const sol::optional<int> &limit ) {
+        require_read();
+        return list_effects(
+                   lua_state, handle, limit,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "has",
+        [current_runtime_generation, current_world_generation, require_read](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id,
+            const std::optional<script_game_id> &body_part,
+    const std::optional<double> &intensity ) {
+        require_read();
+        return has_effect(
+                   lua_state, handle, id, body_part, intensity,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "get",
+        [current_runtime_generation, current_world_generation, require_read](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id,
+    const std::optional<script_game_id> &body_part ) {
+        require_read();
+        return get_effect(
+                   lua_state, handle, id, body_part,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "add",
+        [current_runtime_generation, current_world_generation, require_write](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id,
+            const script_time_duration & duration,
+    const sol::optional<sol::table> &options ) {
+        require_write();
+        return add_effect(
+                   lua_state, handle, id, duration, options,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "remove",
+        [current_runtime_generation, current_world_generation, require_write](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id,
+    const std::optional<script_game_id> &body_part ) {
+        require_write();
+        return remove_effect(
+                   lua_state, handle, id, body_part,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "adjust_intensity",
+        [current_runtime_generation, current_world_generation, require_write](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id, const std::int64_t delta,
+    const std::optional<script_game_id> &body_part ) {
+        require_write();
+        return adjust_effect_intensity(
+                   lua_state, handle, id, delta, body_part,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    effects.set_function(
+        "update",
+        [current_runtime_generation, current_world_generation, require_write](
+            sol::this_state lua_state, const game_handle & handle,
+            const script_game_id & id,
+    const sol::table & options ) {
+        require_write();
+        return update_effect(
+                   lua_state, handle, id, options,
+                   current_runtime_generation(),
+                   current_world_generation() );
+    } );
+    services["effects"] = std::move( effects );
+}
+
+} // namespace cata::lua_platform
+
+#endif // CATA_ENABLE_LUA_PLATFORM

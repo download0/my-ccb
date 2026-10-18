@@ -1,0 +1,45 @@
+[flake8]
+exclude = .git,__pycache__,lang/json,tools/clang-tidy-plugin/test/check_clang_tidy.py
+ignore =
+    # E265 forces comments to have a space after the '#'.  We have a bunch of
+    # optional debugging code commented out this way, and not having a space is
+    # a convenient way to distinguish it from proper comments.  Maybe we should
+    # delete that code, but unless that happens leaving E265 disabled.
+    E265,
+    # W503 and W504 require line breaks after or before binary operators; you
+    # can only have one enabled
+    W504
+
+# Keep new and maintained Python code strict while recording the fork's
+# pre-existing lint debt explicitly.  Remove entries as the legacy tools are
+# modernized.
+per-file-ignores =
+    tools/decompose.py:E201,E202,E225,E275,E302,E501,W291
+    tools/density_audit.py:E226,E302,E401,E501,F541,W391
+    tools/gen_excel_v3.py:E117,E128,E129,E225,E226,E231,E302,E305,E401,E501,E701,E702,E722,F401
+    tools/generate_changelog.py:F824
+    tools/generate_icons.py:E241,E401,E501,E702,F401,F601
+    tools/gfx_tools/tileset_coverage.py:E501
+    tools/gfx_tools/tileset_workbook.py:E501
+    tools/gfx_tools/tileset_workbook_test.py:E501
+    tools/json_tools/generate_overlay_ids.py:E501
+    tools/json_tools/table.py:E501
+    tools/json_tools/util.py:F824
+    tools/replay_ab.py:E501,F541
+    tools/sort_sprites.py:E221,E225,E226,E231,E241,E401,E501,E701,E702,F401,F841
+    # Agent 文档工具：预存超长行，后续随工具现代化逐步清理
+    tools/agent/build_context_pack.py:E501
+    tools/agent/generate_migration_reports.py:E501
+    tools/agent/finalize_legacy_migration.py:E501
+    tools/agent/import_legacy_audits.py:E501
+    tools/agent/generate_markdown_inventory.py:E501
+    tools/agent/test_finalize_legacy_migration.py:E501
+    tools/agent/test_markdown_inventory.py:E501
+    tools/agent/test_context_pack.py:E501
+    tools/agent/test_import_legacy_audits.py:E501
+    tools/agent/test_project_metadata.py:E501
+    tools/agent/test_repository_governance.py:E501
+    # Lua-first extractor: exact emitted Lua/diagnostic strings and matching
+    # fixture assertions are intentionally readable as single source lines.
+    tools/migrate_lua_first.py:E501
+    tools/test_migrate_lua_first.py:E501

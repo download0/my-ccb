@@ -1,0 +1,1015 @@
+# CCB Lua-first Platform v1 / CCB Lua-first 平台 v1
+
+Status: accepted architecture specification for the sole CCB Lua Platform.
+Implementation status is recorded in `ai/lua-first-roadmap.yml`; runtime
+behaviour is proved by `src/lua_platform_*` and test source, not by this page.
+
+状态：CCB 唯一 Lua Platform 的已接受架构规范。实现状态记录在
+`ai/lua-first-roadmap.yml`；运行时事实以 `src/lua_platform_*` 和测试源码为准，本文不
+把设计说明当作实现证明。
+
+## Purpose / 目标
+
+Platform Lua is the native authoring model for CCB core content and Mods. It
+lets authors compose ordinary Lua functions, modules, native domain objects,
+generation-safe handles, named tasks, and persistent state. Public operations
+are shaped around game domains instead of parser keys.
+
+Platform Lua 是 CCB 核心内容和 Mod 的原生创作模型。作者使用普通 Lua 函数、模块、原生
+领域对象、代际安全句柄、命名任务和持久化状态组合行为；公开操作围绕游戏领域设计，
+不暴露旧解析器的键名结构。
+
+Development prioritizes directly usable native capabilities. Automatic EOC
+translation and its dedicated tests are frozen maintenance tools, not prerequisites
+for Platform completion. The replacement ledger retains historical migration
+evidence; its selector counts do not define the development sprint. A requested
+source-only sprint writes implementation and necessary API declarations only;
+documentation, test expansion, builds, checks and acceptance are separate work.
+
+开发优先补齐普通 Lua 可直接使用的原生能力。自动 EOC 迁移器及其专用测试冻结为维护工具，
+不作为平台完成前提；替代账本保留历史证据，其条目数量不定义开发冲刺。明确的纯代码冲刺只修改
+实现和必要 API 声明，说明文档、测试扩展、编译、检查与运行验收另行安排。
+
+## Authoring boundary / 创作边界
+
+For author-facing content, Lua is the only executable content language. All
+new behaviour, policies, conditions, effects, and workflows enter through the
+Platform contract; EOC is not a second behaviour system. One isolated Lua
+state per Mod separates ownership and ordinary Lua globals; it is not process
+isolation, crash containment, a second runtime, or a second public API.
+
+Static JSON may remain when it is passive, schema-validatable data. Such JSON
+and Lua builders enter the same typed C++ content model; the distinction is
+whether the source carries executable behaviour, not whether the source file
+has a particular extension. The existing C++ JSON parser and EOC runner are
+retained as private compatibility infrastructure for the C++ core and old
+Mods while they still have consumers. No new Platform surface may depend on
+them. The EOC runner is removable only after an inventory and reference audit
+proves that EOC references have reached zero; retaining the parser for passive
+or engine-owned JSON is not a failure of the Lua-first direction.
+
+面向作者的内容只有 Lua 一种可执行语言。新的行为、策略、条件、效果和 workflow 都必须
+进入 Platform 契约；EOC 不是第二套行为系统。每个 Mod 一个独立 Lua state 用于区分 owner 和普通全局变量，
+不代表进程隔离或崩溃隔离，也不是第二个 runtime 或第二套公开 API。
+
+只要 JSON 是静态、被动且可由 Schema 校验，就可以长期保留。这样的 JSON 与 Lua builder
+进入同一个类型化 C++ 内容模型；边界在于内容是否携带可执行行为，而不在于文件扩展名。
+现有 C++ JSON parser 和 EOC runner 在仍被本体或旧 Mod 使用时作为私有兼容基础设施保留，
+Platform 新接口不得依赖它们。只有语料和引用审计证明 EOC 引用归零后，才可以删除 EOC
+runner；保留被动或引擎内部 JSON parser 不违背 Lua-first 方向。
+
+## One runtime and one public entry / 唯一运行时与入口
+
+Platform v1 is the only supported Lua runtime, loader, state model, and public
+authoring contract. A Mod receives one package-local `ccb` table from:
+
+```lua
+local ccb = require("ccb")
+```
+
+The loader installs that table in `package.loaded["ccb"]` and provides a
+Mod-local module resolver. Under the accepted trusted-code policy, ordinary
+Lua/package and native module loading also remain available; these are module
+mechanisms, not alternative game-authoring APIs. It does not create a global
+`game` table, a second
+authoring entry, or a compatibility namespace. The Platform may own one Lua
+state per loaded Mod for isolation; those states are all instances of this
+same Platform runtime and share no alternate public contract.
+
+Platform v1 是唯一受支持的 Lua 运行时、加载器、状态模型和作者契约。Mod 通过
+`require("ccb")` 获得包内 `ccb` 表。加载器只注册 `package.loaded["ccb"]` 并提供根目录内
+模块解析；按已采纳的可信代码契约，也允许普通 Lua/package 与原生模块加载。这些是模块
+加载机制，不是另一套游戏创作 API。不创建全局 `game` 表、第二个作者入口或兼容命名空间。为隔离 Mod，Platform
+可以为每个已加载 Mod 持有一个 Lua state；这些 state 都属于同一个 Platform 运行时，
+不存在另一套公开契约。
+
+The authoritative public declaration is
+`data/lua/types/ccb_platform_v1.d.lua`. The public root contains the following
+stable groups:
+
+- `ccb.content` — transactional native definitions and content builders;
+- `ccb.runtime` — named handlers, lifecycle hooks, synchronous callbacks, and
+  persistent task policies;
+- `ccb.dialogue` — typed dialogue topics, responses, and extensions;
+- `ccb.services` — generation-checked world, character, item, creature, NPC,
+  vehicle, map, weather, mission, faction, time, and presentation services;
+- `ccb.state`, `ccb.tasks`, and `ccb.presentation` — bounded persistent and
+  author-facing runtime support.
+
+公开 LuaLS 声明是 `data/lua/types/ccb_platform_v1.d.lua`。公共根表稳定地分为
+`ccb.content`（事务化原生定义）、`ccb.runtime`（命名 handler、生命周期 hook、同步回调和
+持久任务）、`ccb.dialogue`（类型化对话与扩展）、`ccb.services`（代际安全的世界、角色、物品、地图、天气、任务等领域服务），
+以及 `ccb.state`、`ccb.tasks`、`ccb.presentation` 等运行时支持。
+
+## Mod discovery / Mod 发现
+
+A minimal Mod has one root-level `main.lua`:
+
+```text
+my_mod/
+└── main.lua
+```
+
+An optional root-level `mod.lua` may return `ccb.ModDefinition { ... }` for
+explicit metadata and dependencies. The directory name and `main.lua` are the
+defaults. `content/`, `runtime/`, `lib/`, and `tests/` are author choices;
+templates may recommend them but the loader never requires them. A Platform
+Mod does not require a `lua/` directory, `manifest.json`, `modinfo.json`, or
+JSON/EOC author files.
+
+最小 Mod 只需要根目录的 `main.lua`。可选的根目录 `mod.lua` 可以返回
+`ccb.ModDefinition { ... }`，用于显式元数据和依赖；目录名和 `main.lua` 是默认值。
+`content/`、`runtime/`、`lib/`、`tests/` 只是作者的组织选择，模板可以推荐但加载器不
+强制。Platform Mod 不需要 `lua/`、`manifest.json`、`modinfo.json` 或 JSON/EOC 作者文件。
+
+## Trust, libraries, and resource policy / 信任、库与资源契约
+
+Accepted on 2026-09-06: Platform Mods are trusted executable code chosen by the
+player, regardless of author or source. CCB does not promise to protect the
+player's system from them. This is one Platform contract, not separate
+restricted and unrestricted runtime tiers.
+
+- Expose the complete bundled Lua standard library, including `io`, `os`,
+  `debug`, and ordinary `load`, `loadfile`, `dofile`, and `package` facilities.
+  Preserve `require("ccb")` as the stable game API and prefer local modules
+  without making the Mod root a security boundary for other loading paths.
+- Permit external Lua modules and native dynamic libraries where the host
+  platform supports them. Native extensions are executable code with the game
+  process's privileges; authors own OS, architecture, Lua ABI, and dependency
+  compatibility. This does not create a stable ABI for internal C++ objects.
+- Keep per-Mod Lua states for namespacing and ownership. A state is not a
+  thread, a process sandbox, or protection against a native crash.
+- Do not impose mandatory global Lua instruction or memory budgets by default.
+  Profiling, diagnostics and explicitly enabled developer limits may assist
+  debugging. Bounded queries, persistent data formats, valid parameters and
+  handle/lifecycle checks in supported `ccb` services remain API correctness
+  requirements, not a security boundary against trusted code.
+- Present a clear execution-risk notice before first executing downloaded Mod
+  code, including executable `mod.lua` metadata discovery. Selection to trust
+  code is not a per-API permission dialog, and catalog inclusion is not a
+  security guarantee. Record this as an integration requirement, not a claim
+  that a launcher or game notice already exists.
+- Report ordinary Lua errors with context and perform supported cleanup, but
+  do not promise safe interruption of arbitrary loops/native calls, crash
+  containment, or rollback of external filesystem/process side effects.
+
+2026-09-06 已采纳：所有来源的 Mod 均按玩家选择运行的可信代码处理；CCB 不承诺保护玩家系统，
+不划分两套受限/无限制运行时。开放完整 Lua 标准库、文件/系统/调试能力、外部 Lua 模块和
+平台支持的原生动态库；`require("ccb")` 仍是稳定游戏接口，本地模块优先不是安全边界。
+原生扩展作者负责系统、架构、Lua ABI 与依赖适配，引擎内部 C++ ABI 不因此成为稳定公开契约。
+每 Mod 独立 state 只用于命名与 owner 隔离，不能隔离崩溃。默认不设全局执行指令或内存配额；
+可提供自愿启用的诊断限制。`ccb` 的分页、有界数据格式、参数、句柄和生命周期校验继续保留。
+首次执行下载的 Mod 代码前应明确告知风险，包含会执行代码的 `mod.lua` 发现阶段，不对每次
+API 调用弹权限窗口。此告知是待落实的集成要求，不代表现有启动器已实现。普通 Lua 错误应可
+定位与清理，但不承诺无限循环/原生调用可安全中断，也不承诺崩溃隔离或外部副作用回滚。
+
+Integration acceptance evidence is maintained in [PR #768](https://github.com/CrimsonCrossBunker/Cataclysm-Cleanwater-Bomb/pull/768), including the tested build configurations and native runtime results. The behavior below is the source contract; test source alone is not passing evidence. Interactive UI checks and native module packaging on each target platform require their own evidence.
+
+本批整合的编译配置、原生运行结果与验收边界统一记录在 [PR #768](https://github.com/CrimsonCrossBunker/Cataclysm-Cleanwater-Bomb/pull/768)。下文描述源码契约，测试源码存在本身不代表通过；交互界面与各目标平台原生模块打包仍需各自证据。
+
+Implementation checkpoint (2026-09-08): the loader source now opens the bundled
+standard libraries, retains normal package searchers and native loading, and
+inserts a Mod-local searcher before the ordinary searchers. Native search paths
+also start with the Mod root's `?.so` (`?.dll` on Windows), preserving the original
+cpath. Roots containing cpath metacharacters `;` or `?` use explicit
+`package.loadlib` paths instead of an ambiguous automatic prefix. The reserved `ccb`
+entry remains bound to the state-owned Platform table.
+Native loading still depends on the host Lua build and module ABI. The Mod manager now presents a session execution-risk notice before discovering
+Lua metadata (stderr for headless hosts); its startup UI ordering still requires
+interactive acceptance. Direct loader embedders must provide their own notice.
+
+实现断点（2026-09-08）：加载器源码已开放 bundled 标准库，保留普通 package 查找器与原生
+加载入口，并优先查找 Mod 本地模块。原生库搜索路径增加 Mod 根目录的 `?.so`（Windows
+为 `?.dll`），同时保留原有路径；根目录含 `;` 或 `?` 时可使用明确的 `package.loadlib`
+路径，避免 cpath 语法歧义。`require("ccb")` 仍固定返回所属 state 的 Platform 根表。原生模块仍取决于宿主 Lua
+构建与 ABI。Mod 管理器已在元数据发现前加入每会话风险告知（无界面宿主输出到 stderr），
+启动 UI 顺序仍待交互验收；直接调用加载器的宿主应自行提供告知。
+
+Ordinary Lua 5.4 `require` returns the module and loader data on its first load.
+If `mod.lua` forwards a module that returns a `ccb.ModDefinition`, use
+`return (require("metadata"))` or assign its first return to a local variable;
+metadata still requires exactly one typed return value. This does not change
+`require("ccb")`, which always returns the reserved Platform root alone.
+
+普通 Lua 5.4 的 `require` 首次加载会返回模块及加载来源两个值。`mod.lua` 若转发返回
+`ccb.ModDefinition` 的模块，应写 `return (require("metadata"))`，或先用局部变量接收第一个
+结果再返回；元数据仍要求恰好一个类型化返回值。`require("ccb")` 只返回固定的 Platform 根表。
+
+## Loading and lifecycle / 加载与生命周期
+
+The Platform lifecycle is a single transaction around the native engine:
+
+1. discover root entries and parse optional native metadata;
+2. resolve dependencies and create candidate Platform states;
+3. run `main.lua` while static definitions are staged in `ccb.content`;
+4. validate references, apply inheritance/patch operations, finalize native
+   registries, and retain only a valid candidate;
+5. commit the candidate atomically or roll it back in reverse registration
+   order;
+6. expose world-ready services and run named lifecycle/task policies;
+7. retire states and invalidate their handles on shutdown or world replacement.
+
+World and runtime generations are checked together with an opaque owner
+identity. A handle copied within its owner remains a value, but it cannot be
+used after owner retirement, runtime replacement, world replacement, or an
+invalidated transaction. Raw C++ pointers, lifetime owners, and internal
+generation counters are never part of the Lua contract.
+
+Platform 生命周期围绕原生引擎形成一条事务链：发现入口、解析依赖、创建候选 state、在
+`ccb.content` 中暂存定义、校验引用并 finalize、成功后原子提交或逆序回滚、进入
+world-ready 后提供服务，最后在退出或世界替换时使旧句柄失效。句柄访问同时校验
+owner 身份、runtime 代次和 world 代次；C++ 裸指针、owner 和内部代次计数器不属于 Lua
+契约。
+
+Runtime code may be swapped only when the static content fingerprint is
+unchanged. A changed content fingerprint requires a full data reload. Runtime
+replacement preserves only the state explicitly defined by Platform lifecycle
+and persistence rules; external filesystem or process side effects are trusted
+code responsibilities and are not silently rolled back.
+
+An author-tool entry under **Debug menu → Game → Reload Lua Mod scripts**
+also appears in the searchable debug action list. It calls the existing runtime
+swap operation for active Mods, preserves its static-content gate, and displays
+loader failures. Reload is rejected while an active Mod still has an executing
+Lua call stack. A successful swap does not imply callbacks succeeded; inspect
+the message log. Interactive UI acceptance remains separate from native backend
+tests. Restart the game when static definitions change.
+
+调试菜单的“游戏 → 重新加载 Lua Mod 脚本”入口调用已有脚本替换后端，也可通过调试
+动作搜索找到。活动 Mod 仍在执行 Lua 或静态定义发生变化时会拒绝替换并显示原因；
+成功替换注册表不代表回调无错误，
+应查看消息日志。修改静态定义后重启游戏；菜单交互验收仍独立于后端原生回归。
+
+The **Debug menu → Console → Lua** tab executes an explicitly submitted
+text chunk in a selected, already loaded Mod's state. Use `require("ccb")` as
+usual and `return` to display values. Execution is deferred until outside the
+ImGui drawing frame; it neither creates another runtime nor automatically runs
+saved input. Console changes are immediate and are not rolled back on error.
+The explicit call enters the selected owner's callback scope; normal world-ready,
+handle-generation and domain checks still apply to services.
+Return display shows at most 16 values and 1024 source bytes per string, escaping
+control bytes and replacing invalid UTF-8. Returned tables show up to 20 raw
+fields in unspecified order; nested tables and other objects appear as type
+labels. No `__pairs` or `__tostring` runs. Return a nested field explicitly to
+inspect it. These are display limits, not script quotas.
+Recursive execution in the same state and execution during a script reload are
+rejected. Interactive console acceptance remains separate from native backend tests.
+
+“调试菜单 → 控制台 → Lua”页在选定的已加载 Mod 状态中执行手动提交的文本代码。
+继续使用 `require("ccb")`，用 `return` 显示结果；执行安排在 ImGui 绘制帧之外，
+不创建第二套运行时，也不自动执行保存的输入。修改立即生效，后续报错不会回滚。
+手动调用进入所选 owner 的回调上下文，服务继续检查 world-ready、句柄代次和领域规则。
+最多展示 16 个返回值，每个字符串最多读取 1024 字节，转义控制字节、替换无效 UTF-8；
+返回表最多展示 20 个原始字段，顺序不作保证；嵌套表和其他对象仅显示类型，
+不调用 `__pairs` 或 `__tostring`。要进一步查看，显式返回嵌套字段即可。
+这只是显示限制，不是脚本配额。
+同一状态递归执行以及重载过程中的执行会被拒绝。控制台交互验收仍独立于后端原生回归。
+
+Item fingerprints include patch-field presence: omitting a field inherits its
+source value, while explicitly supplying a default value overwrites it.
+物品指纹包含补丁字段是否显式提供：省略字段继承来源值，显式默认值则覆盖来源值。
+
+## Native content model / 原生内容模型
+
+`ccb.content` is a pure-Lua native typed builder and registrar surface, not a
+JSON key mirror or raw JSON pass-through. Domain-specific typed option tables
+are valid inputs when the corresponding builder declares and validates them;
+they are not generic legacy objects for a later loader. A domain builder has a
+stable id, bounded scalar inputs, typed references, and explicit transaction
+ownership. The registrar design supports the following operations where the
+domain requires them:
+
+- add a new definition;
+- replace or extend an earlier definition with clear ownership;
+- delete only an entry owned by the current transaction;
+- resolve references in deterministic dependency order;
+- finalize caches and derived relationships once;
+- undo every mutation in reverse order on candidate failure.
+
+`ccb.content.extend_item_group(definition)` accepts a newly built `ItemGroup`
+as an entry-only patch to an existing group of the same collection/distribution
+kind. It preserves native entries and contributions from earlier Mods, keeps
+the target's ammo/magazine defaults unchanged, and fingerprints the extension.
+Candidate rollback restores the previous entry boundary. `edit_item_group`
+instead clones a definition staged earlier by the same Mod; it is not a way
+to extend a native group or another Mod's group.
+
+`ccb.content.extend_item_group(definition)` 将新建的 `ItemGroup` 作为纯条目补丁，
+追加到同类的既有物品组中，保留原生内容和更早 Mod 的条目，不改变弹药/弹匣默认概率。
+追加内容参与指纹计算，候选事务回滚时恢复原有条目边界。`edit_item_group` 只克隆本 Mod
+此前暂存的定义，不能代替这种跨 Mod 或原生物品组的扩展。
+
+Complex registrar work is still an implementation milestone. Until a domain's
+source, declaration, migration shape, test source, and documentation are
+closed, its ledger disposition remains unverified or bounded. Unsupported
+inheritance, dynamic references, implicit defaults, or side effects become
+classified migration TODOs rather than hidden parser calls. A registrar may
+share the typed C++ storage and finalization pipeline with passive JSON, but
+that implementation reuse never changes the Lua authoring contract into a JSON
+loader.
+
+`ccb.content` 是纯 Lua 原生类型化 builder/registrar，而不是 JSON key 镜像或 raw JSON
+透传。只要相应 builder 声明并校验，领域化的类型化 option table 就可以作为输入；它们
+不是交给旧 loader 的通用旧对象。定义具有稳定 id、有界标量、类型化引用和明确事务 owner；
+按领域需要支持 add、replace/extend、owned delete、确定性引用顺序、finalize 和逆序 undo。
+复杂 registrar 仍是实现里程碑；在源码、声明、迁移形状、测试源码和文档闭合前，账本只能
+标记未验证或 bounded。未支持的继承、动态引用、隐式默认值和副作用必须转为分类明确的
+TODO。实现可以与被动 JSON 共用类型化 C++ 存储和 finalize 管线，但不能因此把 Lua 契约
+变成 JSON loader，也不能直接接受 `JsonObject` 或 raw JSON pass-through。
+
+## Domain services / 领域服务
+
+The current Platform surface is organized by native responsibility rather than
+legacy selector names. Important service families include:
+
+- identity and snapshots for characters, creatures, NPCs, items, vehicles,
+  missions, zones, and world locations;
+- bounded inventory, equipment, item-use, crafting, recipes, requirements,
+  mutations, bionics, skills, proficiencies, martial arts, effects, and needs;
+- map, overmap, weather, time, factions, camps, hordes, gates, mapgen, and
+  world information;
+- dialogue, activities, interactions, hooks, named tasks, messages, and
+  presentation callbacks.
+
+Each service documents read/write phase, bounds, return envelope, lifetime
+guards, and failure behavior. Read operations require a readable active
+Platform context. Mutations require the correct transaction or runtime phase.
+Callbacks receive typed payloads and handles, not arbitrary engine objects.
+
+`services.mutations.remove_type(character, type)` removes every mutation whose
+native `types` contains the requested string, using `unset_mutation` semantics
+(no purifier downgrade or prerequisite restoration). The explicit Character
+handle may target an avatar or NPC; runtime write and handle lifetime guards
+apply. The type must be nonempty, NUL-free and at most 256 bytes. An unknown type
+is a successful no-op. The result contains `type`, a detached `removed` array of
+`GameId<mutation>`, and `removed_count`; array ordering is unspecified.
+Migration lowers literal `u_lose_mutation_type` / `npc_lose_mutation_type` only
+when the corresponding actor is proven. Dynamic legacy variables, additional
+options and ambiguous actors remain explicit manual-rewrite TODOs; ordinary
+Lua can compute the string before calling this service.
+
+Purifiability conditions query `services.mutations.is_purifiable(character, id)`
+and unwrap its result envelope. Reading the static definition would ignore
+Character-specific intrinsic overrides. This migration covers literal ids and
+proven actors; unsupported shapes remain TODOs. These bounded implementations
+are not claims of full EOC semantic acceptance.
+
+`remove_type` 按突变的 `types` 成员批量移除，不按突变类别筛选，也不会恢复前置突变。
+可净化条件必须读取指定角色的动态状态，不能以定义的静态标记代替。
+当前只自动转换目标明确的受支持参数；其余输入保留明确 TODO，不计为全面语义验收通过。
+
+The migrator does not automatically lower legacy `add_trait`, `lose_trait`,
+`activate_trait` or `deactivate_trait` effects (either actor) to `grant`, `remove`
+or `set_active`. Adding a legacy trait clears other mutations sharing its types;
+`grant` preserves them and emits an event. Removal differs in base-trait
+bookkeeping and event policy. Repeated native activation/deactivation may consume
+resources, transform a mutation or invoke callbacks, whereas `set_active` skips
+an already-satisfied state. These inputs produce a located `semantic_choice`
+TODO, including in false branches. Authors choose the intended ordinary Lua
+composition; the public services retain their existing domain contracts. Their
+ledger entries are primitive availability, not automatic migration equivalence.
+
+旧特质增删与激活/停用不能直接等同于当前 Lua 操作。迁移器对这八个玩家/NPC 效果明确
+报告 `semantic_choice`，而不是静默改变冲突清理、基础特质、事件或重复调用行为。
+这表示已有可用领域接口，但旧行为的替代组合仍需明确设计，不能算迁移等价通过。
+
+Mapgen callbacks may stage bounded static NPC and global zone requests with
+`ScriptMapgenContext:queue_npc` and `queue_zone` (128 of each per callback).
+They validate IDs and current-OMT coordinates without spawning external objects.
+Failed callbacks discard the requests. After the map transaction commits, native
+publication installs zones first, then NPCs with native unique-ID deduplication.
+Publication is a post-commit phase, not part of submap rollback; native publication
+errors are logged and do not turn a committed primary map into a fallback map.
+Immediate `place_npc`, `place_zone`, vehicle and other external mutations remain
+unavailable inside the callback. Ordinary runtime service writes remain blocked.
+`ScriptMapgenContext:set_item_faction` is a map-only ownership operation: it
+updates ground stacks and their contents inside the current OMT and participates
+in submap rollback. It does not assign vehicle or vehicle-cargo ownership.
+
+`ccb.presentation.canvas` runs a bounded frame callback in the native ImGui
+window system, using registered tileset sprites rather than a second UI runtime.
+It requires a ready world and an active runtime callback; no renderer means
+`false` without invoking Lua drawing or charging for an interaction. Logical
+canvas dimensions are 1..2048 pixels, scaled together to fit the display. Each
+frame permits 4096 primitives and its context is invalidated on return, including
+errors. Canvases cannot nest. They use real time without advancing game turns.
+`allow_quit=false` requires the Mod to provide its own close control. Callback
+failures close the window and propagate to the caller. Optional canvas music and
+`ccb.presentation.play_sound` reuse native audio with canonical asset paths
+confined to the owning Mod; temporary music is restored when the canvas exits.
+
+Native barter UI and service payments are available through
+`ccb.services.trade.open(npc, buyer, cost, title)` and `pay(npc, buyer, cost)`.
+They require explicit live parties and reject any buyer other than the active
+avatar; no removed dialogue-context purchase helpers or implicit avatar aliases
+are restored. `order_price(npc, buyer, item_id, count)` is a read-only quote for
+made-to-order goods using `npc_trading::trading_price_for_order`. Lua must
+revalidate the price before payment and explicitly handle inventory delivery.
+This is not a reservation of existing Items; existing-stock transfers continue
+to use the exact-Item `quote/get/commit` API.
+
+领域服务按原生职责组织，而不是按旧 selector 命名，覆盖身份与 snapshot、角色/生物/NPC/
+物品/载具/任务/区域、背包与 crafting、地图与天气、时间与派系、对话、活动、hook、持久
+任务和 presentation。每个服务都应说明读写阶段、边界、返回 envelope、生命周期保护和
+失败行为；回调接收类型化 payload 与句柄，不接收任意引擎对象。
+
+## Persistence, tasks, and failure semantics / 持久化、任务与失败语义
+
+- Persist explicit serializable state and stable entity identities, not live
+  handles, functions, C++ pointers, or arbitrary Lua globals. Exact scopes,
+  accepted value types and payload bounds are defined in LuaLS and native code.
+- Persistent tasks refer to named handlers and versioned payloads. On reload,
+  resolve identities into fresh handles; unavailable entities, missing handlers
+  and payload migrations follow the documented retry/failure policy.
+- Native service results, optional values, errors, snapshots and cursors follow
+  each declared signature. A detached snapshot is not a writable engine object;
+  tokens/cursors can expire and must not be reused after their stated lifetime.
+- Content registration rollback is not a universal gameplay transaction.
+  Multi-step world operations are atomic only where the API explicitly promises
+  it. Files, processes and native extension side effects remain author-owned.
+
+持久化只保存明确可序列化的数据与稳定身份，不保存活句柄、函数、指针或任意全局变量；作用域、
+类型与边界以 LuaLS/源码为准。持久任务绑定命名 handler 与版本化 payload，重载后重新解析
+句柄，缺失实体/handler 与 payload 迁移遵循各自失败或重试约定。结果、快照和游标按具体签名
+使用；快照不是可写引擎对象，失效 token 不可复用。内容注册回滚不等于任意世界操作有事务，
+只有接口明确声明的操作才保证原子性；外部文件、进程和原生扩展副作用不在回滚承诺内。
+
+The serializer enforces the existing encoded-size limits while
+staging JSON, rather than first constructing an arbitrarily larger buffer. The
+state codec retains its 1 MiB limit and runtime scope files retain 16 MiB. Failed
+serialization does not begin writing to the destination. Value/key limits and
+file formats are unchanged.
+
+序列化在暂存 JSON 时就执行现有编码大小限制，避免先完整生成过大的缓冲区再拒绝。
+状态 codec 仍为 1 MiB，运行时作用域文件仍为 16 MiB；序列化失败前不会开始写入目标。
+键、值额度与文件格式不变。
+
+Lua save output also overrides the generic JSON writer's fixed decimal
+precision on these private staging streams. Finite state and payload doubles use
+round-trip precision, preserving small fractions and large magnitudes without
+changing other game JSON writers. Old files remain readable, but precision lost
+in earlier saves cannot be recovered.
+
+Lua 存档输出同时覆盖通用 JSON 写入器的固定小数精度，只作用于其私有临时流。
+有限状态数值与任务 payload 的 double 使用往返精度，保留小数和大数量级，不改变其他
+游戏 JSON 写入器。旧文件仍可读取，但此前保存时已经损失的精度无法恢复。
+Task query results (`tasks.get`, `tasks.next`, and `tasks.list`) are detached
+snapshots. The lifetime fix copies selected native records before allocating
+Lua result tables, so cancellation during a Lua allocation cannot invalidate the
+records being returned. Native regression source models cancellation at that
+boundary.
+
+任务查询 `tasks.get`、`tasks.next`、`tasks.list` 返回独立快照。生命周期修复在
+分配 Lua 返回表前复制选中的原生记录，避免 Lua 分配期间取消任务导致正在返回的记录
+失效。回归测试源码模拟该边界上的取消操作。
+
+The same task-lifetime fix keeps the existing migration mutation guard active
+while constructing metadata, invoking the callback, decoding its result and
+committing the candidate. It restores the previous flag on success or failure;
+this does not introduce a sandbox or roll back unrelated callback side effects.
+
+同一任务生命周期修复把已有迁移保护覆盖到元数据构造、回调、返回值解码与候选提交全程，
+成功或失败都会恢复此前的标记；这不引入沙盒，也不回滚无关的回调副作用。
+
+Task-counter persistence stores each Mod's `last_task_id` in both
+state scopes, including records with no pending tasks. Loading takes the maximum
+counter across loaded scopes and pending records; exhausted signed task-ID space
+remains exhausted. Absent-Mod records retain the counter when resaved. Older
+version-1 records without this optional field still load using their pending task
+IDs; IDs already discarded before that legacy save cannot be reconstructed.
+
+任务计数器持久化在两个存档作用域的 Mod 记录中保存 `last_task_id`，任务列表为空时
+也保留。加载时合并所加载作用域的最大计数，耗尽的有符号 ID 空间不会因重进而重置；
+暂未加载的 Mod 记录再次保存时也保留计数。旧版 v1 记录缺少该可选字段时，仍按尚存任务
+推导计数；旧存档写入前已丢弃的任务 ID 无法追溯恢复。
+
+The due-task cancellation fix keeps selected tasks visible to queries and
+cancellable until their individual dispatch starts. A preceding callback can
+cancel a later task due in the same processing pass. Selection still snapshots
+the pass and uses due-turn/ID ordering: newly scheduled tasks wait for a later
+processing pass.
+
+同轮到期任务取消修复让尚未开始派发的任务继续可查、可取消：前一个回调可以取消
+同一处理轮中后续到期任务。该轮候选仍为快照，按到期回合与 ID 排序；回调新建的任务
+留到下一次处理。
+
+The read-only `ccb.state.world.keys(after_key?, limit?)` and character-scope
+equivalent expose copied keys for the owning Mod after `world_ready`. Pages use
+bytewise lexicographic order, an exclusive string cursor and a default limit of
+20 (1..200). They include total/matched/returned counts and `next_after` only when
+another page exists. Values remain behind `get`; modifying the returned table
+does not mutate state. Each call takes a fresh snapshot, so restart pagination
+if keys change between calls.
+
+只读接口 `ccb.state.world.keys(after_key?, limit?)` 及角色作用域版本在 world-ready
+后枚举当前 Mod 的键，返回复制的键名，不包含值。按字节字典序排列，字符串游标表示严格
+晚于该键；默认每页 20 项，可选 1–200。结果含总数、匹配数、返回数，仅有下一页时提供
+`next_after`。修改返回表不修改状态；每次调用重新获取快照，分页期间键变化时应重新开始。
+
+## Behaviour instead of EOC / 用 Lua 行为表达能力
+
+Lua expresses conditions, effects, branching, loops, composition, and policy
+with ordinary code over Platform services. A native service can expose a
+bounded operation such as a snapshot query or a typed mutation; it must not
+recreate an EOC key tree, a JSON loader, or an opaque runner.
+
+The current goal and progress are in
+`data/lua/LUA_FIRST_EOC_WORKFLOW.md`. Build capabilities in response to actual
+Mod and migration needs. Historical ledger entries describe their stated scope;
+they do not make every EOC selector an API requirement or a recurring test gate.
+A complete replacement claim needs evidence for the scope it names.
+
+The legacy C++ JSON parser and EOC runner remain private compatibility paths for
+core and old-Mod definitions during the transition. Platform definitions do
+not call them. When the last EOC reference is gone, the runner can be deleted;
+that deletion is a separate retirement gate and does not require deleting all
+passive, schema-validated JSON.
+
+Lua 使用 Platform 服务表达条件、效果、分支、循环和策略。原生服务可以提供有界 snapshot
+查询或类型化变更，但不能重建 EOC 键树、JSON loader 或不透明 runner。当前目标和进度见
+`data/lua/LUA_FIRST_EOC_WORKFLOW.md`。按真实 Mod 和迁移需求补能力；历史账本仅说明
+已记录的范围，不要求每次修改逐条验收 EOC。声称完整替代时须提供对应范围的证据。
+
+过渡期间，现有 C++ JSON parser 和 EOC runner 作为本体及旧 Mod 定义的私有兼容路径保留，
+Platform 定义不会调用它们。最后一个 EOC 引用消失后才进入 runner 删除门禁；这不要求删除
+所有静态、可由 Schema 校验的 JSON。
+
+## Migration TODO taxonomy / 迁移 TODO 分类
+
+Every migration TODO carries one primary category and a source location:
+
+- `auto_fix` — the required Platform API already exists, but the migrator does
+  not generate the correct Lua shape yet; fix the migrator/output rather than
+  adding a new core capability;
+- `manual_rewrite` — an author or maintainer must express the workflow in
+  ordinary Lua because there is no safe mechanical translation;
+- `platform_gap` — the required typed native service, registrar, or lifecycle
+  boundary does not exist yet; only this category drives Platform core work;
+- `semantic_choice` — the old shape permits more than one intentional native
+  interpretation and a human must choose the desired behaviour.
+
+TODOs are boundary records, not completion records or a progress score. A
+smaller TODO count can hide a lossy rewrite, while a larger count can be honest
+evidence of bounded coverage. Platform closure is judged by the source,
+declaration, tests, documentation, and safety boundary of each capability
+batch; no milestone requires TODOs to reach zero.
+
+每个迁移 TODO 都带一个主分类和源位置：`auto_fix` 表示所需 Platform API 已存在，但迁移器
+尚未生成正确的 Lua 形状，应修复迁移器/输出而不是增加核心能力；`manual_rewrite` 是作者或维护者必须用普通 Lua 重写的工作流；`platform_gap` 表示所需
+的类型化 native service、registrar 或生命周期边界尚不存在，只有这一类会驱动 Platform 核心
+开发；`semantic_choice` 表示旧形状存在多个有意的原生解释，必须由人选择行为。
+
+TODO 是边界记录，不是完成记录或进度分数。更少的 TODO 可能意味着有损重写，更多的 TODO 反而可能是
+诚实的有界覆盖。Platform 是否闭合要看每个能力批次的源码、声明、测试、文档和安全边界，
+任何里程碑都不要求 TODO 归零。
+
+## Tools and evidence / 工具与证据
+
+The source of current Platform references is deliberately small:
+
+- `data/lua/types/ccb_platform_v1.d.lua` — LuaLS contract;
+- `src/lua_platform_*.cpp` and `.h` — native registrations and lifecycle;
+- `data/lua/reference/ccb_platform_*.schema.json` — explicit schemas;
+- `tools/lua_api/generate_platform_native_inventory.py` and its checker;
+- `tools/lua_api/generate_platform_contract.py` and its checker;
+- `tools/lua_api/generate_platform_coverage.py` and its checker;
+- `tools/agent/generate_lua_first_replacement_ledger.py` — real JSON/EOC
+  disposition source;
+- `tools/migrate_lua_first.py` and `tests/lua_platform_test.cpp` — migration
+  and semantic evidence sources.
+
+Generated references, ledger, documentation registry, and migration reports are
+outputs; never hand-edit them. Refresh only those affected by changed inputs.
+Current goals and progress are in [the Lua status page](LUA_FIRST_EOC_WORKFLOW.md).
+
+Platform reference、账本、文档 registry 与迁移报告是生成输出，禁止手改；只在相关输入
+变化时刷新受影响的文件。当前目标和进度见 [Lua 状态页](LUA_FIRST_EOC_WORKFLOW.md)。
+
+PR 664's foundation scope and later capabilities retain their evidence in
+`ai/lua-first-roadmap.yml`. They are not recurring prerequisites for every
+change. Optional standard helpers, internationalization and author tools remain
+separate needs. Proposed `ccb.std` helper names are not frozen public contracts;
+any future implementation uses the sole `require("ccb")` entrypoint.
+
+PR 664 的基础设施范围和后续能力证据保留在 roadmap，不作为每轮修改的重复前置条件。
+可选标准 helper、国际化与作者工具按需求独立推进；候选 `ccb.std` 名称不是冻结公开契约，
+未来实现仍使用唯一 `require("ccb")` 入口。
+
+### Runtime text internationalization / 运行时文本国际化（草稿实现）
+
+The independent draft exposes `ccb.services.translate(text, context?)` and
+`ccb.services.translate_plural(singular, plural, count, context?)` after
+`world_ready`. Both return strings using the current native catalog. Literal
+calls can be extracted by `tools/lua_api/extract_translations.py`; its README
+contains the author example and catalog limitations. This is source-level work,
+not completed native acceptance. Metadata translations, content builders beyond
+Item/Skill/SkillDisplay, and live catalog reload remain outside this slice.
+
+For Item names/descriptions, the draft also accepts immutable `LocalizedText`
+values from `ccb.content.text(text, context?)` and
+`ccb.content.plural_text(singular, plural, context?)`. These retain source text
+for native deferred translation; ordinary strings keep their untranslated
+behavior. Item descriptions reject plural values. A singular marked name uses
+the same source for plural fallback; use `plural_text` to supply a distinct
+plural. Source forms must be nonempty and all inputs must exclude NUL. Inherited
+fields retain the parent's translation object; explicit strings replace it.
+Context, plural form and literal/translated status enter the static fingerprint.
+
+独立草稿提供上述运行时文本接口，复用原生翻译目录、上下文与复数规则。这里只完成实现、
+声明、提取工具与测试源码；原生编译、真实语言目录及切换验收尚未执行。不能据此宣称
+完整国际化已经完成，也不将它加入核心 Platform 或 EOC 全量验收的前置条件。
+
+物品名称与说明还可接收 `ccb.content.text(text, context?)` 或
+`ccb.content.plural_text(singular, plural, context?)` 构造的不可变 `LocalizedText`。
+它保留源文本供原生层延迟翻译；普通字符串仍不翻译，说明字段不接受复数值。
+仅标记单数的名称以相同源文本作为复数回退；需要不同复数时使用 `plural_text`。
+源文本不能为空，所有输入均不允许 NUL。继承字段保留父定义的翻译对象，显式字符串替换它；
+上下文、复数和是否翻译均计入静态指纹。除下述 Skill／SkillDisplay 外的其他内容 builder、
+Mod 元数据及目录热重载仍待推进。
+
+The same `content.text` marker now also covers Skill names/descriptions,
+SkillDisplay labels, and theory/practice level descriptions. All of these fields
+are singular-only and reject `content.plural_text`. Plain strings remain literal;
+omitting a practice description still leaves the independent practice map alone.
+Translation context participates in static fingerprints. Native source tests cover
+fallback display, invalid plural input, atomic method failure and rollback;
+locale/catalog execution remains unverified.
+
+同一个 `content.text` 也可用于 Skill 名称、说明、SkillDisplay 分类名称以及理论／实践
+等级说明。这些字段只接收单数文本，拒绝 `content.plural_text`；普通字符串仍保持字面值，
+省略实践说明时仍不改动独立的实践映射。翻译上下文参与静态指纹。原生测试源码覆盖源文本
+显示、拒绝复数、方法失败时不部分改写以及回滚；语言／目录运行验收仍未执行。
+
+## Templates, examples, and maintenance / 模板、样例与维护
+
+`data/lua/templates/minimal/` and `complete/` are authoring scaffolds. The
+bundled `data/mods/Lua_First_Example/` is a runnable root-`main.lua` example;
+it demonstrates a vertical slice, not whole-platform completion. Templates
+may suggest `content/`, `runtime/`, and local modules but must not turn those
+suggestions into loader requirements.
+
+Changes to discovery, lifecycle, native registrations, declarations, schema,
+migration behavior, or roadmap status update this specification and the
+affected CCB-Docs ids. Source and tests remain authoritative; prose never
+promotes a planned capability into a shipped one.
+
+`data/lua/templates/minimal/`、`complete/` 是创作脚手架，内置
+`data/mods/Lua_First_Example/` 是根目录 `main.lua` 的可运行纵向样例，不代表整个平台完成。
+模板只能建议目录结构，不能把建议变成加载器要求。发现、生命周期、原生注册、声明、
+schema、迁移行为或 roadmap 状态变化时同步更新本文和对应 CCB-Docs id；源码与测试始终
+优先于说明文案。
+
+### Explicit empty scalar values / 显式空值
+
+`ccb.services.types.null` is an immutable `NullValue`: it retains a key in a
+Lua context, scalar callback/task payload, or persistent state. `nil` retains
+its ordinary Lua deletion semantics. `tostring(null)` is the empty string;
+compare against the explicit value rather than using Lua truthiness. Variable
+snapshots expose a present empty value as `exists=true, value=nil`, so a
+missing-value fallback applies only when `exists=false`. Native dialogue `get`
+returns `NullValue` for a stored empty value and `nil` for an absent key.
+Typed save entries encode it as `type="null", value=null`; existing scalar
+entries keep their encoding. Context-to-native math conversion retains it as
+an empty native value. Native regression execution for this addition is pending
+batch acceptance; it does not promote EOC selectors to verified by itself.
+
+显式空值可跨上下文、标量任务载荷和存档保留“键存在”的信息。`nil` 仍用于删除，
+默认值只在键不存在时生效；不能用 Lua 的真假判断代替存在性判断。本项新增原生
+回归须在批次末实际运行，通过前不提升相关 EOC 完成标记。
+
+### Variable reads with two participants
+
+`services.variables.resolve(context, actor, scope, key, participants)` accepts an
+optional `{ alpha = handle, beta = handle }` table. When supplied, actor-scoped
+reads select that participant, including the final target of indirect references.
+An absent participant reports a missing value and does not fall back to `actor`.
+Calls without the table retain their explicit-owner behavior. This extension has
+source and regression coverage; native execution remains part of batch acceptance.
+
+`services.variables.set_resolved(context, actor, scope, key, value, participants)`
+uses the same optional participant selection for writes. Missing participants return
+`missing_actor` without writing through the fallback actor. Context nil deletion
+and explicit `services.types.null` storage keep their existing behavior.
+
+Variable snapshots represent empty elements inside native arrays with
+`services.types.null`, preserving leading, trailing, and nested array slots.
+A top-level empty variable still uses `exists = true, value = nil`.
+
+Variable writes accept dense arrays recursively, including `services.types.null`
+slots. Array conversion uses the same depth and node bounds as snapshot reads;
+sparse arrays, named keys, cycles, and unsupported elements fail before native
+mutation. This enables native variable-array round trips. Task payloads and persistent
+state also support owned dense arrays as described below.
+
+### Persistent dense arrays
+
+Task payload fields and state values accept dense arrays of scalars, explicit
+`services.types.null`, and nested arrays. Conversion copies every element into
+immutable owned storage; reads produce fresh Lua tables. Type-tagged array
+entries preserve integers, floats, strings, booleans, and empty elements across
+save/load. Existing scalar encodings are unchanged. Each value allows at most
+512 nodes and 8 nesting levels, within the existing string and total storage
+limits. Sparse tables, named keys inside arrays, cycles, nonfinite numbers,
+functions, and live handles fail before the state or task is changed.
+Source and regression tests are present; native acceptance remains pending.
+
+Persistent values also accept absolute map-square `TripointCoord` values, including
+inside arrays. They save three integer components under `tripoint_abs_ms` and
+restore a typed coordinate, without retaining any map pointer. Other coordinate
+spaces remain rejected at this persistence boundary.
+
+Mutation `set_active(character, mutation, active, retrigger)` remains idempotent
+by default. Passing `retrigger = true` explicitly invokes activation or
+deactivation even when the requested state is already satisfied, allowing repeated
+resource costs, charge progression, and native callbacks. Existing permanent-trait
+and activatable-trait requirements still apply. Native parity for other mutation
+shapes remains unverified.
+
+`services.mutations.invoke_activation(character, mutation, active)` executes the
+native activation/deactivation action directly, including repeated costs,
+transformations, and callbacks. Unlike setting a permanent mutation's state,
+this action also permits cached or absent traits and does not require the
+`activated` definition flag. It validates the mutation id and exact Character
+handle, and returns the resulting permanent-presence and active flags.
+
+`services.mutations.erase(character, mutation)` invokes native mutation clearing,
+retaining base-trait bookkeeping and emitting no additional loss event. It accepts
+an already-absent mutation. `remove` continues to perform its documented base-trait
+and event synchronization. Both operations retain native cache and hook behavior.
+
+`services.mutations.replace(character, mutation, variant)` clears other mutations
+sharing any mutation type before invoking native set semantics. It preserves
+base-trait bookkeeping, adds no gain/loss events, and permits repeated assignment.
+Native hooks and variant fallback remain active. `grant` retains its distinct
+non-conflicting grant and gain-event behavior.
+
+Mutation definition enumeration accepts `services.mutations.definitions({order = "native"})`
+to retain the loaded registry order, including across pages. The default `order = "id"`
+continues to sort identifiers. Migrated trait iteration requests native order so that
+random draws and the final iteration variable follow the source traversal. This option
+and its native regression source still require the batch native acceptance gate.
+
+Vitamin definition enumeration supports the same `order = "id" | "native"` option
+through `services.vitamins.definitions`. Native order is retained after query
+filtering and before pagination; the default remains ID order. Migrated vitamin
+iteration requests native order. Its C++ regression source covers both ordering
+modes and filtered pages; native execution remains part of batch acceptance.
+
+`services.registry.list` and `services.registry.definitions.list` also accept
+`order = "native"`; omitted or `"id"` keeps identifier sorting. Each order has a
+separate catalog cache, invalidated together on language changes. Native order
+means the registry's enumeration order, not a stable order across different data
+loads. Filtering retains that order and pagination is applied afterward. Migrated
+body-part and JSON-flag traversal requests it. Native test execution is still due.
+
+`services.hordes.monsters(group, recursive, {order = "native"})` preserves the
+native group traversal sequence, including repeated monster occurrences. Default
+`order = "id"` keeps the sorted, unique list. Pagination in native mode counts
+occurrences, and migrated monster-group iteration requests this mode. Native
+comparison test source is present; execution remains due at batch acceptance.
+
+`services.items.possible_from_group(group, {order = "native"})` preserves
+the native item-group pointer-set traversal order. The default remains sorted
+unique item IDs. Native order is meaningful within the current process and data
+load, not a stable ordering across launches. Migrated item-group iteration uses
+this option. Native comparison test source is present; execution remains due.
+
+Migrated nested `foreach` loops snapshot their inputs separately and share
+the dialogue variable store. An inner loop does not restore the outer iterator
+value on return; the next outer iteration overwrites it normally. Unsupported
+nested effects still leave a migration gap. Generated Lua execution covers this
+ordering; native comparison execution remains due.
+
+Migrated `foreach` arrays also accept the string `game_option` mutator.
+Its option name resolves dialogue participants independently, and all option
+values are read before the first iterator write or body effect. Missing or
+non-string options fail explicitly. Generated Lua tests cover both participants,
+snapshot timing and failure before body execution; native execution is pending.
+
+Dynamic `foreach` strings can read monster default factions and translated
+martial-art technique names or flavor descriptions through typed definition
+services. Their identifiers may recursively use supported string expressions;
+participant variables retain their own alpha/beta ownership. Generated Lua
+execution checks nested option lookup and full-array evaluation before effects.
+Native comparison execution and the remaining string mutators are still due.
+
+Migrated `foreach` strings support `valid_technique` through
+`characters.choose_technique`, selecting for alpha against beta before body
+execution. Dynamic blacklist strings retain participant ownership. Blacklists
+have no additional entry-count cap; required character provenance and ID
+validation remain explicit migration limits. Generated Lua tests cover flags,
+300-entry lists and selection timing. A same-seed native comparison test is
+provided but has not run; this is not evidence of full native selector parity.
+
+Explicit `{str = ..., i18n = true}` string expressions in migrated
+`foreach` arrays use `services.translate`, including nested supported mutator
+arguments. Plain string literals remain untranslated. Translation runs while
+building the input snapshot, before body effects. Generated Lua execution covers
+this order; native localization comparison is still pending.
+
+`activities.revert_npc_job` always performs native NPC state restoration,
+including idle NPCs with pending backlog or saved mission/attitude state.
+Migrated `revert_activity` calls this operation instead of cancellation.
+The result reports `restored = true`; the legacy `changed` field only records
+whether a job was active beforehand. Generated Lua routing/error tests pass;
+the idle-NPC native comparison test still awaits execution.
+
+NPC work migration uses `activities.assign_npc_job` for butchery, planks,
+trees, construction, farming, fishing, mining, mopping, repeated reading,
+study, loot sorting, disassembly, and vehicle deconstruction/repair. These
+operations assign the native activity actors instead of approximating work
+with a fixed duration. Generated Lua tests verify all fourteen routes and
+failure propagation. Native assignment comparison test source is present but
+has not executed; other interactive NPC job paths still require review.
+
+Migrated NPC reading, ebook reading and crafting use the corresponding
+`assign_npc_job` operations and native selection flows. A returned
+`assignment_rejected` leaves execution free to continue, matching native
+return-without-assignment behavior; other service errors propagate. Generated
+Lua tests cover success, no assignment and stale-handle failure. Interactive
+selection and gameplay acceptance remain pending.
+
+The `find_mount` NPC job follows native creature traversal and assigns the
+selected mount. When none is available, it restores an active player-directed
+NPC job before returning `no_match`; idle NPCs remain unchanged. Migrated
+`find_mount` treats that result as a normal return and propagates other errors.
+Generated Lua branch tests pass; native active/idle no-match comparison source
+is present but has not executed. Successful mount selection still needs runtime
+acceptance.
+
+Migrated `morale_chat_activity` uses the native socialize actor for the
+avatar and the exact NPC partner for ten minutes. `drop_items_in_place` uses
+the native `drop_carried_items` order, retaining its inventory filtering and
+empty-inventory behavior. Generated Lua tests verify event and overridden NPC
+participants; native activity execution and inventory outcomes remain unverified.
+
+Migrated `start_training` calls `npcs.training.start_selected` with the
+exact NPC provider and avatar student. It retains the native selected course,
+payment and duration calculation instead of assigning a fixed training timer.
+A successful call that starts no training remains a normal return. Generated
+Lua routing/error tests pass; native course/payment execution remains pending.
+
+`npcs.training.start_selected(provider, avatar, "seminar")` opens native
+seminar participant selection, retaining follower eligibility and cancellation.
+The avatar handle is validated before selection; returned provider/player flags
+do not enumerate all seminar students. Migrated `start_training_seminar` uses
+this mode. Generated Lua cancellation/routing tests pass; native menu, payment
+and multi-student training acceptance remain pending.
+
+Selected training also supports `"npc"` mode: the avatar teaches the exact
+NPC using that NPC's selected dialogue course. The avatar argument remains
+explicit and validated even though its role changes to teacher. Migrated
+`start_training_npc` uses this mode when its NPC is proven. Generated Lua
+role/routing tests pass; native skill transfer, fees and activity completion
+remain pending acceptance.
+
+Grooming effect migration invokes native style selection for hair/beard and
+native haircut/shave services with the exact NPC and avatar client. These
+effects are no longer silently discarded. Without a proven NPC they remain
+explicit migration gaps. Generated Lua tests cover all four calls and missing
+provider handling; native appearance and morale outcomes await acceptance.
+
+`trade.open` optionally resolves the seller's native intercom trade delegate;
+default calls retain the explicit seller. Migrated `start_trade` enables
+delegation, uses the active avatar, zero initial cost and a translated title.
+Cancellation is a normal return. Generated Lua tests cover that contract;
+native buyer-validation test source is present but unexecuted, and delegated
+barter UI acceptance remains pending.
+
+NPC wake, dismount, temporary-rule reset and lead-to-safety effects migrate
+to native NPC orders. This preserves wake effects/rules and native dismount
+and destination behavior instead of skipping the command or only changing
+attitude. Generated Lua routing tests pass; wake/rule-reset native comparison
+test source is present but unexecuted. Mounted and pathfinding outcomes still
+require native acceptance.
+
+Migrated NPC conversation ending calls `npcs.dialogue.finish`, preserving
+the native first-topic change to `TALK_DONE` without exiting the Lua callback.
+Stat reveal and combat-style selection open their native NPC interfaces.
+Generated Lua tests cover the three operations in sequence; native topic-state
+comparison source is present but unexecuted, and the two menus await interactive
+acceptance. Missing NPC provenance remains a migration gap.
+
+Combat-insult migration invokes `npcs.dialogue.provoke_combat`, preserving
+the native topic change and hostility together. Generated Lua tests verify
+event/override NPC routing; native topic/attitude comparison source is present
+but unexecuted. This does not establish combat gameplay acceptance.
+
+Follower migration uses `join_player`, `stop_temporary_following` and
+`make_neutral` instead of attitude-only writes. This retains follower/faction
+setup and cash transfer, the allied-NPC stop guard and stranger-topic reset.
+Generated Lua routing tests pass; allied/non-allied state comparison source
+is present but unexecuted. Join-state runtime evidence remains outstanding. Stop/neutral operations
+now call native talk functions so their notification rules are retained; message
+comparison test source is present but has not executed.
+
+Migrated `leave` uses `leave_player` to remove follower membership, create
+the independent faction and reset work priorities/topic. Native leave notification
+and direct mission reset are preserved, including the previous-mission value.
+`follow_only` uses `follow_temporarily` to clear guard and long-term goals
+without transferring cash or joining the player faction. Generated Lua routing
+tests pass; temporary-follow native comparison source is unexecuted and full
+leave/faction runtime acceptance remains pending.
+
+Confrontation migration routes `hostile`, `flee`, `player_leaving`,
+`start_mugging` and `remove_stolen_status` through their existing NPC services.
+This preserves hostile-event dispatch and its already-hostile guard, visibility-based
+hostility notification, flee/mugging messages, departure patience and stolen-item
+claim clearing. Generated Lua exercises participant overrides and error propagation;
+native message/patience comparison source is present but unexecuted. Hostile event,
+visibility and stolen-item lifecycle runtime acceptance remain pending.
+
+Guard assignment/removal migration uses `set_guarding` and its native talk functions,
+rather than attitude-only changes. This retains the allied/non-allied branches,
+activity restoration, guard destinations and topics, and the allied stop notification.
+Generated Lua participant/error tests pass; allied/non-allied stop-state comparison
+source remains unexecuted, and assignment/camp/activity runtime coverage is pending.
+
+Gratitude migration checks the `make_thankful` result and retains the resolved NPC
+participant. Generated Lua covers routing and failure propagation; native comparison
+source covers hostile/non-hostile attitudes, friend-topic retention and personality
+bounds, but has not been compiled or executed.
+
+Medical-aid migration uses `npcs.medical.provide_aid` for all four native aid effects:
+basic/advanced treatment with or without nearby walking allies. The existing service
+calls the native talk functions, including healing, relevant wound removal, patient
+waiting activity and provider busy duration. Unproven NPC providers remain explicit
+migration gaps. Generated Lua tests cover all four level/allies combinations, avatar
+patient identity, provider overrides and failure propagation. Random healing, ally
+range filtering and activity/effect duration runtime acceptance remain pending.
+
+Control transfer and its menu are no longer classified as successfully migrated
+no-ops. Their migration still needs participant continuity across handle invalidation
+and, for direct transfer, original dialogue branching. Bare-string `clear_dimension`
+and `place_override` are also explicit gaps: their native registrations require
+object parameters. This does not affect the existing object-form world renderers.
+
+Control-service rejection test source checks non-allied targets and wrong avatar
+participants, including identity/faction/attitude retention and no handle invalidation.
+This source has not run and does not establish successful transfer, menu cancellation,
+or post-transfer callback continuity. The menu implementation already invalidates
+handles only when the native avatar identity changes.
+
+Avatar handles now capture the native character ID and reject an in-place identity
+change with `stale_avatar_identity`, even before the enclosing control service
+invalidates the runtime handles. Fresh handles use the new character ID. This closes
+the stale-avatar window during native control-transfer hooks without changing their
+ordering. A focused in-place identity regression is present as unexecuted test source;
+full control-transfer and hook runtime acceptance remain pending.
+
+Animal-purchase migration keeps center-first nearby placement and passes
+`upgrade=false` to `spawns.monster` (omitted upgrade retains the existing true default).
+Successful chicken/horse/cow placement sets friendliness to -1 and the permanent pet
+effect. Blocked placement continues; other errors propagate. These native effects do
+not charge payment themselves. Generated Lua tests cover species, participant overrides,
+pet setup and blocked/error continuation. Native placement/upgrade/pet runtime acceptance
+and the original blocked-placement debug notification remain outstanding.
+A fixed-seed native comparison source now covers chicken/horse/cow position, type,
+friendliness and permanent pet duration; it has not been compiled or executed.
+
+Spawn-upgrade regression source additionally uses an upgrade-capable test monster
+with evolution enabled, covering omitted/true/false arguments and uninitialized
+upgrade time for the disabled path. It remains unexecuted; ordinary pet species
+alone are not evidence that the upgrade option works.
+
+Refusal migration uses `npcs.record_refusal` for follow, lead, equipment, training
+and personal-info requests, checking failures and retaining the resolved participant.
+The native cooldown durations are unchanged. Generated Lua verifies all request routes
+and failure propagation; repeated-request duration/permanence comparison exists as
+unexecuted C++ test source.
+
+NPC class/faction/first-topic migration resolves supported string expressions at each
+operation through the participant-aware string renderer, then checks the service result.
+The earlier class/faction branch that rejected dynamic values has been consolidated.
+Generated Lua tests mutate a context variable between operations to verify live lookup,
+participant overrides and failure propagation. Full native parameter/participant
+coverage remains unverified; unsupported expressions retain explicit migration gaps.
+
+NPC radio-representative migration now calls `set_radio_representative` with the
+resolved NPC and current avatar owner, matching the native global-owner choice.
+Generated Lua checks participant overrides, owner identity and failure propagation.
+Unexecuted native test source checks representative marking, repeated registration
+and retention of other representatives. Full native dialogue/owner acceptance is pending.
+
+`npcs.request_talk` retains the native wants-to-talk notification: only on an actual
+attitude transition and only when the NPC sees the avatar. NPC wants-to-talk migration
+uses this service and checks its result. Generated routing/error tests pass; repeated
+request silence has unexecuted C++ coverage, and visible/hidden native comparison
+remains pending. Generic attitude writes keep their existing behavior.
+
+Explicit callback wants-to-talk migration distinguishes alpha (`u_`) and beta (`npc_`).
+Either participant may be an NPC; non-NPC participants are skipped as in native
+`get_npc()` handling. Generated Lua covers two NPCs, avatar alpha, and two non-NPC
+participants. This routing evidence does not replace native visibility acceptance.
+
+Explicit callback `u_make_radio_representative` now registers an NPC alpha with the
+current avatar owner; it does not substitute beta or use alpha as the owner.
+Generated Lua verifies independent alpha/beta registrations. Non-NPC misuse is
+skipped; parity with the original null-NPC debug diagnostic remains outstanding.
+This diagnostic boundary and native runtime evidence prevent full semantic acceptance.
+
+`trade.selling_offers(npc)` returns native `init_selling` entries in their original
+order, with exact Item handles and native price/count/charges. It neither reserves nor
+transfers items and does not replace the exact-item quote/commit transaction. Prices
+are native NPC offer valuations, not guaranteed settlement prices. A native comparison
+source is present but unexecuted. Allowance-gift selection and settlement remain pending.

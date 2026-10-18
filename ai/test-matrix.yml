@@ -1,0 +1,142 @@
+schema_version: 1
+kind: test_matrix
+description: Acceptance-gate validation routing, not a per-edit execution mandate. Expensive commands may require platform dependencies.
+entries:
+  - id: agent-context
+    paths: [AGENTS.md, CLAUDE.md, GEMINI.md, GOVERNANCE.md, ai/, tools/agent/, .github/copilot-instructions.md]
+    command: python3 -m unittest discover -s tools/agent -p 'test_*.py'
+    workdir: .
+    cost: fast
+  - id: publisher-contract
+    paths: [.github/workflows/publish-pr-artifacts.yml, tools/agent/test_publish_pr_artifacts.py]
+    command: python3 -m unittest discover -s tools/agent -p 'test_publish_pr_artifacts.py'
+    workdir: .
+    cost: fast
+  - id: governance-audit
+    paths:
+      - OWNERSHIP.md
+      - REPOSITORY_SETTINGS.md
+      - ai/repository-settings.target.yml
+      - ai/repository-settings.target.schema.json
+      - .github/dependabot.yml
+      - .github/workflows/
+      - tools/agent/audit_repository_governance.py
+      - tools/agent/test_repository_governance.py
+    command: python3 tools/agent/audit_repository_governance.py --check
+    workdir: .
+    cost: fast
+  - id: documentation-impact
+    paths: [ai/docs-impact.yml, tools/agent/check_docs_impact.py, tools/agent/test_docs_impact.py, .github/pull_request_template.md, .github/workflows/agent-context.yml]
+    command: python3 tools/agent/check_docs_impact.py --changed-file ai/docs-impact.yml && python3 -m unittest discover -s tools/agent -p 'test_docs_impact.py'
+    workdir: .
+    cost: fast
+  - id: python-tools
+    paths: [tools/]
+    command: make python-check
+    workdir: .
+    cost: fast
+  - id: cpp-format
+    paths: [src/, tests/, tools/]
+    command: make astyle-check
+    workdir: .
+    cost: fast
+  - id: cpp-tests
+    paths: [src/, tests/]
+    command: make -j2 tests && ./tests/cata_test
+    workdir: .
+    cost: expensive
+  - id: json-load
+    paths: [data/]
+    command: make -j2 json-check
+    workdir: .
+    cost: medium
+  - id: json-eoc-contract
+    paths:
+      - src/init.cpp
+      - src/condition.cpp
+      - src/npctalk.cpp
+      - src/effect_on_condition.cpp
+      - data/core/
+      - data/json/
+      - data/mods/
+      - data/sound/
+      - data/reference/json/
+      - doc/JSON/
+      - tools/json_api/
+    command: python3 tools/json_api/generate_contracts.py --check && python3 -m unittest discover -s tools/json_api -p 'test_*.py'
+    workdir: .
+    cost: medium
+  - id: lua-contract
+    paths: [CMakeLists.txt, Makefile, tests/CMakeLists.txt, tests/Makefile, tests/test_support_sources.txt, src/CMakeLists.txt, src/lua/CMakeLists.txt, src/main.cpp, 'src/lua_platform*.cpp', 'src/lua_platform*.h', src/event.h, data/lua/, tools/lua_api/]
+    command: python3 -m unittest discover -s tools/lua_api -p 'test_*.py'
+    workdir: .
+    cost: fast
+  - id: lua-authoring
+    paths: [tools/create_lua_mod.py, tools/test_create_lua_mod.py, tools/lua_api/mod_sdk.py, tools/lua_api/test_mod_sdk.py, data/lua/templates/, data/lua/types/]
+    command: python3 tools/test_create_lua_mod.py
+    workdir: .
+    cost: fast
+  - id: lua-playable-mvp
+    paths:
+      - src/lua_platform_loader.cpp
+      - src/lua_platform_runtime.cpp
+      - src/lua_platform_runtime_dialogue.cpp
+      - src/lua_platform_runtime_hooks.cpp
+      - src/lua_platform_runtime_internal.h
+      - src/lua_platform_runtime_lifecycle.cpp
+      - src/lua_platform_runtime_services.cpp
+      - src/lua_platform_content_presentation.cpp
+      - src/lua_platform_content_presentation.h
+      - src/lua_platform_content_worldgen.cpp
+      - src/lua_platform_content_worldgen.h
+      - src/lua_platform_content_items.cpp
+      - src/lua_platform_content_items.h
+      - src/lua_platform_content_creatures.cpp
+      - src/lua_platform_content_creatures.h
+      - src/lua_platform_content_character.cpp
+      - src/lua_platform_content_character.h
+      - src/game_io.cpp
+      - src/mod_manager.cpp
+      - src/mod_manager_ui.cpp
+      - data/mods/Lua_First_Example/
+      - 'tests/lua_platform*.cpp'
+      - tests/mod_manager_test.cpp
+    command: make -j1 BUILD_PREFIX=lua-native- ODIR="$PWD/build/lua-native-obj" CATA_ENABLE_LUA_PLATFORM=1 CATA_TEST_SUITE=lua ASTYLE=0 LINTJSON=0 LOCALIZE=0 DEBUGSYMS= tests && ./tests/lua-native-cata_test '[playable_mvp]' --rng-seed 20260812 --warn NoTests
+    workdir: .
+    cost: expensive
+  - id: lua-disabled-build
+    paths:
+      - src/lua_platform_loader.cpp
+      - src/lua_platform_runtime.cpp
+      - src/lua_platform_runtime_dialogue.cpp
+      - src/lua_platform_runtime_hooks.cpp
+      - src/lua_platform_runtime_internal.h
+      - src/lua_platform_runtime_lifecycle.cpp
+      - src/lua_platform_runtime_services.cpp
+      - src/lua_platform_content_presentation.cpp
+      - src/lua_platform_content_presentation.h
+      - src/lua_platform_content_worldgen.cpp
+      - src/lua_platform_content_worldgen.h
+      - src/lua_platform_content_items.cpp
+      - src/lua_platform_content_items.h
+      - src/lua_platform_content_creatures.cpp
+      - src/lua_platform_content_creatures.h
+      - src/lua_platform_content_character.cpp
+      - src/lua_platform_content_character.h
+      - src/mod_manager.cpp
+      - data/mods/Lua_First_Example/
+      - tests/mod_manager_test.cpp
+      - 'tests/lua_platform_test*'
+    command: make -j2 BUILD_PREFIX=lua-disabled- ODIR=lua-disabled-obj CATA_ENABLE_LUA_PLATFORM=0 ASTYLE=0 LINTJSON=0 LOCALIZE=0 DEBUGSYMS= tests && ./tests/lua-disabled-cata_test 'lua_first_platform_disabled_build_rejects_runtime_sources' --rng-seed 20260812
+    workdir: .
+    cost: expensive
+  - id: cmake-configure
+    paths: [CMakeLists.txt, CMakeModules/, CMakePresets.json]
+    command: cmake --preset linux-x64
+    workdir: .
+    cost: medium
+  - id: android-unit
+    paths: [android/]
+    command: ./gradlew test
+    workdir: android
+    cost: expensive

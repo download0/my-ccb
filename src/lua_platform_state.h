@@ -1,0 +1,114 @@
+#pragma once
+#ifndef CATA_SRC_LUA_PLATFORM_STATE_H
+#define CATA_SRC_LUA_PLATFORM_STATE_H
+
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
+#include <map>
+#include <memory>
+#include <vector>
+#include <streambuf>
+#include <string>
+#include <unordered_map>
+#include <variant>
+
+class JsonValue;
+class JsonObject;
+class JsonOut;
+
+namespace cata::lua_platform
+{
+
+// A present empty value, distinct from Lua nil (which removes a table key).
+struct script_null_value {
+    void serialize( JsonOut &json ) const;
+    bool operator==( const script_null_value & ) const {
+        return true;
+    }
+    bool operator!=( const script_null_value & ) const {
+        return false;
+    }
+};
+
+// Absolute map-square coordinates are values, not live map references.
+struct script_persistent_tripoint {
+    int x;
+    int y;
+    int z;
+    void serialize( JsonOut &json ) const;
+    bool operator==( const script_persistent_tripoint &other ) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+    bool operator!=( const script_persistent_tripoint &other ) const {
+        return !( *this == other );
+    }
+};
+
+struct script_persistent_array;
+// Immutable, owned array storage; copies never retain a Lua table or game pointer.
+class script_array_value
+{
+    public:
+        explicit script_array_value( script_persistent_array value );
+        const script_persistent_array &get() const;
+        void serialize( JsonOut &json ) const;
+        bool operator==( const script_array_value &other ) const;
+        bool operator!=( const script_array_value &other ) const;
+    private:
+        std::shared_ptr<const script_persistent_array> value_;
+};
+
+using script_persistent_value = std::variant<bool, std::int64_t, double, std::string,
+      script_null_value, script_array_value, script_persistent_tripoint>;
+struct script_persistent_array {
+    std::vector<script_persistent_value> values;
+};
+
+using script_persistent_state = std::unordered_map<std::string, script_persistent_value>;
+using script_value_map = std::map<std::string, script_persistent_value>;
+
+constexpr std::size_t persistent_state_max_keys = 1024;
+constexpr std::size_t persistent_state_max_key_bytes = 256;
+constexpr std::size_t persistent_state_max_string_bytes = 64U * 1024U;
+constexpr std::size_t persistent_state_max_value_bytes = 512U * 1024U;
+constexpr std::size_t persistent_state_max_file_bytes = 1024U * 1024U;
+
+namespace detail
+{
+// Append-only staging for state JSON. The attached ostream must enable badbit
+// exceptions so a limit failure stops serialization immediately.
+class bounded_state_output_buffer final : public std::streambuf
+{
+    public:
+        bounded_state_output_buffer( std::size_t maximum_bytes, std::string limit_error );
+        const std::string &str() const noexcept;
+
+    protected:
+        std::streamsize xsputn( const char *data, std::streamsize count ) override;
+        int_type overflow( int_type ch ) override;
+
+    private:
+        std::size_t maximum_bytes_;
+        std::string limit_error_;
+        std::string output_;
+};
+// Write the type and value members inside an already-open JSON object.
+void write_persistent_value( JsonOut &json, const script_persistent_value &value );
+script_persistent_value read_persistent_value( const JsonObject &entry );
+} // namespace detail
+
+// Assign one validated value without partially changing the state on failure.
+// Throws std::invalid_argument when a key, value, or total state limit is
+// exceeded.
+void assign_persistent_value( script_persistent_state &state, const std::string &key,
+                              const script_persistent_value &value );
+
+// Versioned, typed JSON codec.  Integers and floating-point values deliberately
+// retain distinct types across a save/load round trip.
+void write_persistent_state( std::ostream &output, const script_persistent_state &state );
+script_persistent_state read_persistent_state( const JsonValue &input );
+
+} // namespace cata::lua_platform
+
+#endif // CATA_SRC_LUA_PLATFORM_STATE_H

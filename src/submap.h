@@ -1,0 +1,529 @@
+#pragma once
+#ifndef CATA_SRC_SUBMAP_H
+#define CATA_SRC_SUBMAP_H
+
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "active_item_cache.h"
+#include "basecamp.h"
+#include "calendar.h"
+#include "cata_type_traits.h"
+#include "colony.h"
+#include "compatibility.h"
+#include "computer.h"
+#include "construction.h"
+#include "coordinates.h"
+#include "field.h"
+#include "item.h"
+#include "map_scale_constants.h"
+#include "mapdata.h"
+#include "mapgen_primitives.h"
+#include "mdarray.h"
+#include "point.h"
+#include "trap.h"
+#include "type_id.h"
+#include "units.h"
+#include "vehicle.h"
+
+// IWYU pragma: no_forward_declare vehicle // behind unique_ptr
+// IWYU pragma: no_forward_declare basecamp // behind unique_ptr
+class JsonOut;
+class JsonValue;
+class map;
+
+struct spawn_point {
+    point_sm_ms pos;
+    int count;
+    mtype_id type;
+    int faction_id;
+    int mission_id;
+    bool friendly;
+    std::optional<std::string> name;
+    spawn_data data;
+    explicit spawn_point( const mtype_id &T = mtype_id::NULL_ID(), int C = 0,
+                          point_sm_ms P = point_sm_ms::zero,
+                          int FAC = -1, int MIS = -1, bool F = false,
+                          const std::optional<std::string> &N = std::nullopt, const spawn_data &SD = spawn_data() ) :
+        pos( P ), count( C ), type( T ), faction_id( FAC ),
+        mission_id( MIS ), friendly( F ), name( N ), data( SD ) {}
+};
+
+struct terrain_growth_state {
+    time_point fertilized_at = calendar::turn_zero;
+};
+
+// Suppression due to bug in clang-tidy 12
+// NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
+struct maptile_soa {
+    cata::mdarray<ter_id, point_sm_ms>             ter; // Terrain on each square
+    cata::mdarray<furn_id, point_sm_ms>            frn; // Furniture on each square
+    cata::mdarray<std::uint8_t, point_sm_ms>       lum; // Num items emitting light on each square
+    cata::mdarray<cata::colony<item>, point_sm_ms> itm; // Items on each square
+    cata::mdarray<field, point_sm_ms>              fld; // Field on each square
+    cata::mdarray<trap_id, point_sm_ms>            trp; // Trap on each square
+    cata::mdarray<int, point_sm_ms>                rad; // Irradiation of each square
+
+    void swap_soa_tile( const point_sm_ms &p1, const point_sm_ms &p2 );
+};
+
+class submap
+{
+    private:
+        // Keep the hot tile storage and its uniform fallback in the same cache line.
+        std::unique_ptr<maptile_soa> m;
+        ter_id uniform_ter = t_null;
+
+    public:
+        submap() = default;
+        submap( submap && ) noexcept( map_is_noexcept );
+        ~submap();
+
+        submap &operator=( submap && ) noexcept;
+
+        void ensure_nonuniform() {
+            if( is_uniform() ) {
+                m = std::make_unique<maptile_soa>();
+                std::uninitialized_fill_n( &m->ter[0][0], elements, uniform_ter );
+                std::uninitialized_fill_n( &m->frn[0][0], elements, furn_str_id::NULL_ID() );
+                std::uninitialized_fill_n( &m->lum[0][0], elements, 0 );
+                std::uninitialized_fill_n( &m->trp[0][0], elements, tr_null );
+                std::uninitialized_fill_n( &m->rad[0][0], elements, 0 );
+            }
+        }
+
+        void revert_submap( submap &sr );
+
+        submap get_revert_submap() const;
+
+        trap_id get_trap( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                return tr_null;
+            }
+            return m->trp[p.x()][p.y()];
+        }
+
+        void set_trap( const point_sm_ms &p, trap_id trap ) {
+            ensure_nonuniform();
+            m->trp[p.x()][p.y()] = trap;
+        }
+
+        void set_all_traps( const trap_id &trap ) {
+            ensure_nonuniform();
+            std::uninitialized_fill_n( &m->trp[0][0], elements, trap );
+        }
+
+        furn_id get_furn( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                return furn_str_id::NULL_ID();
+            }
+            return m->frn[p.x()][p.y()];
+        }
+
+        void set_furn( const point_sm_ms &p, furn_id furn ) {
+            geometry_version_.changed();
+            ensure_nonuniform();
+            m->frn[p.x()][p.y()] = furn;
+        }
+
+        void set_all_furn( const furn_id &furn ) {
+            geometry_version_.changed();
+            ensure_nonuniform();
+            std::uninitialized_fill_n( &m->frn[0][0], elements, furn );
+        }
+        int get_map_damage( const point_sm_ms &p ) const {
+            auto it = ephemeral_data.find( p );
+            if( it != ephemeral_data.end() ) {
+                return it->second.damage;
+            }
+            return 0;
+        }
+
+        void set_map_damage( const point_sm_ms &p, int dmg ) {
+            ephemeral_data[p] = { dmg };
+        }
+
+        const terrain_growth_state *get_terrain_growth( const point_sm_ms &p ) const {
+            const auto it = terrain_growth.find( p );
+            return it == terrain_growth.end() ? nullptr : &it->second;
+        }
+
+        void set_terrain_growth( const point_sm_ms &p, const terrain_growth_state &state ) {
+            ensure_nonuniform();
+            terrain_growth[p] = state;
+        }
+
+        void clear_terrain_growth( const point_sm_ms &p ) {
+            terrain_growth.erase( p );
+        }
+
+        bool has_finite_liquid( const point_sm_ms &p ) const {
+            return finite_liquids.find( p ) != finite_liquids.end();
+        }
+
+        int get_finite_liquid( const point_sm_ms &p ) const {
+            const auto it = finite_liquids.find( p );
+            return it == finite_liquids.end() ? 0 : it->second;
+        }
+
+        void set_finite_liquid( const point_sm_ms &p, int charges ) {
+            if( charges > 0 ) {
+                ensure_nonuniform();
+                finite_liquids[p] = charges;
+            } else {
+                finite_liquids.erase( p );
+            }
+        }
+
+        ter_id get_ter( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                return uniform_ter;
+            }
+            return m->ter[p.x()][p.y()];
+        }
+
+        void set_ter( const point_sm_ms &p, ter_id terr ) {
+            geometry_version_.changed();
+            ensure_nonuniform();
+            m->ter[p.x()][p.y()] = terr;
+        }
+
+        void set_all_ter( const ter_id &terr, bool uniform_ok = false ) {
+            geometry_version_.changed();
+            if( !uniform_ok ) {
+                ensure_nonuniform();
+            }
+            if( is_uniform() ) {
+                uniform_ter = terr;
+            } else {
+                std::uninitialized_fill_n( &m->ter[0][0], elements, terr );
+            }
+        }
+
+        int get_radiation( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                return 0;
+            }
+            return m->rad[p.x()][p.y()];
+        }
+
+        void set_radiation( const point_sm_ms &p, const int radiation ) {
+            ensure_nonuniform();
+            m->rad[p.x()][p.y()] = radiation;
+        }
+
+        uint8_t get_lum( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                return 0;
+            }
+            return m->lum[p.x()][p.y()];
+        }
+
+        void set_lum( const point_sm_ms &p, uint8_t luminance ) {
+            ensure_nonuniform();
+            m->lum[p.x()][p.y()] = luminance;
+        }
+
+        void update_lum_add( const point_sm_ms &p, const item &i ) {
+            ensure_nonuniform();
+            if( i.is_emissive() && m->lum[p.x()][p.y()] < 255 ) {
+                m->lum[p.x()][p.y()]++;
+            }
+        }
+
+        void update_lum_rem( const point_sm_ms &p, const item &i );
+
+        // TODO: Replace this as it essentially makes itm public
+        cata::colony<item> &get_items( const point_sm_ms &p ) {
+            if( is_uniform() ) {
+                cata::colony<item> static noitems;
+                return noitems;
+            }
+            return m->itm[p.x()][p.y()];
+        }
+
+        const cata::colony<item> &get_items( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                cata::colony<item> static noitems;
+                return noitems;
+            }
+            return m->itm[p.x()][p.y()];
+        }
+
+        // TODO: Replace this as it essentially makes fld public
+        field &get_field( const point_sm_ms &p ) {
+            if( is_uniform() ) {
+                field static nofield;
+                return nofield;
+            }
+            return m->fld[p.x()][p.y()];
+        }
+
+        const field &get_field( const point_sm_ms &p ) const {
+            if( is_uniform() ) {
+                field static nofield;
+                return nofield;
+            }
+            return m->fld[p.x()][p.y()];
+        }
+
+        void clear_fields( const point_sm_ms &p );
+
+        struct cosmetic_t {
+            point_sm_ms pos;
+            std::string type;
+            std::string str;
+        };
+
+        void insert_cosmetic( const point_sm_ms &p, const std::string &type, const std::string &str ) {
+            cosmetic_t ins;
+
+            ins.pos = p;
+            ins.type = type;
+            ins.str = str;
+
+            cosmetics.push_back( ins );
+        }
+
+        units::temperature_delta get_temperature_mod() const {
+            return units::from_fahrenheit_delta( temperature_mod );
+        }
+
+        void set_temperature_mod( units::temperature_delta new_temperature_mod ) {
+            temperature_mod = units::to_fahrenheit_delta( new_temperature_mod );
+        }
+
+        bool has_graffiti( const point_sm_ms &p ) const;
+        const std::string &get_graffiti( const point_sm_ms &p ) const;
+        void set_graffiti( const point_sm_ms &p, const std::string &new_graffiti );
+        void delete_graffiti( const point_sm_ms &p );
+
+        // Signage is a pretend union between furniture on a square and stored
+        // writing on the square. When both are present, we have signage.
+        // Its effect is meant to be cosmetic and atmospheric only.
+        bool has_signage( const point_sm_ms &p ) const;
+        // Dependent on furniture + cosmetics.
+        std::string get_signage( const point_sm_ms &p ) const;
+        // Can be used anytime (prevents code from needing to place sign first.)
+        void set_signage( const point_sm_ms &p, const std::string &s );
+        // Can be used anytime (prevents code from needing to place sign first.)
+        void delete_signage( const point_sm_ms &p );
+
+        bool has_computer( const point_sm_ms &p ) const;
+        const computer *get_computer( const point_sm_ms &p ) const;
+        computer *get_computer( const point_sm_ms &p );
+        void set_computer( const point_sm_ms &p, const computer &c );
+        void delete_computer( const point_sm_ms &p );
+
+        bool contains_vehicle( vehicle * );
+
+        bool is_open_air( const point_sm_ms & ) const;
+
+        void rotate( int turns );
+        void mirror( bool horizontally );
+
+        void store( JsonOut &jsout ) const;
+        void load( const JsonValue &jv, const std::string &member_name, int version );
+
+        // Runtime-only identity follows the geometry through moves. A moved-from
+        // storage has no valid stamp until its next geometry write. No pointer,
+        // save field, gameplay RNG or turn number is used for cache freshness.
+        std::pair<std::uint64_t, std::uint64_t> geometry_stamp() const noexcept {
+            return { geometry_version_.identity, geometry_version_.revision };
+        }
+
+        // If is_uniform is true, this submap is a solid block of terrain
+        // Uniform submaps aren't saved/loaded, because regenerating them is faster
+        bool is_uniform() const {
+            return !static_cast<bool>( m );
+        }
+
+        // Merge the contents of the two submaps onto the target submap. If there is a
+        // conflict the overlay wins out. Note that it's technically possible for both
+        // submaps to actually be overlays, but the one that's not called out is treated
+        // as the basic map for merging precedent purposes.
+        // The operation is intended for mapgen where data from the "official" generation
+        // may have to be merged with data generated from chunks targeting different
+        // Z levels.
+        void merge_submaps( submap *copy_from, bool copy_from_is_overlay );
+
+        std::vector<cosmetic_t> cosmetics; // Textual "visuals" for squares
+
+        active_item_cache active_items;
+
+        int field_count = 0;
+        time_point last_touched = calendar::turn_zero;
+        bool reverted = false; // NOLINT(cata-serialize)
+        // This tracks that a submap was edited outside of mapgen, and that it should be
+        // considered for having its data hoisted to the overmap.
+        bool player_adjusted_map = false;
+        std::vector<spawn_point> spawns;
+        /**
+         * Vehicles on this submap (their (0,0) point is on this submap).
+         * This vehicle objects are deleted by this submap when it gets
+         * deleted.
+         */
+        std::vector<std::unique_ptr<vehicle>> vehicles;
+        std::map<tripoint_sm_ms, partial_con> partial_constructions;
+        std::unique_ptr<basecamp> camp;  // only allowing one basecamp per submap
+
+        struct tile_data {
+            int damage;
+        };
+
+    private:
+        static std::uint64_t next_geometry_identity() noexcept;
+        struct geometry_version {
+            std::uint64_t identity = next_geometry_identity();
+            std::uint64_t revision = 0;
+            geometry_version() = default;
+            geometry_version( geometry_version &&other ) noexcept :
+                identity( std::exchange( other.identity, 0 ) ),
+                revision( std::exchange( other.revision, 0 ) ) {}
+            geometry_version &operator=( geometry_version &&other ) noexcept {
+                if( this != &other ) {
+                    identity = std::exchange( other.identity, 0 );
+                    revision = std::exchange( other.revision, 0 );
+                }
+                return *this;
+            }
+            void changed() noexcept {
+                if( identity == 0 || ++revision == 0 ) {
+                    identity = next_geometry_identity();
+                    revision = 0;
+                }
+            }
+        };
+        std::map<point_sm_ms, tile_data> ephemeral_data;
+        std::map<point_sm_ms, terrain_growth_state> terrain_growth;
+        // Liquid belonging to finite source terrain is map state, not a
+        // ground item.  Keeping it separate prevents item sprites and pickup
+        // rules from leaking through the water surface.
+        std::map<point_sm_ms, int> finite_liquids;
+        std::map<point_sm_ms, computer> computers;
+        int temperature_mod = 0; // delta in F
+        // Tracks original terrain for tiles transformed by phase logic
+        std::map<point_sm_ms, ter_id> original_terrain;
+
+        // Runtime cache metadata is separate from serialized terrain state.
+        geometry_version geometry_version_; // NOLINT(cata-serialize)
+
+    public:
+        bool has_original_ter( const point_sm_ms &p ) const;
+        ter_id get_original_ter( const point_sm_ms &p ) const;
+        void set_original_ter( const point_sm_ms &p, const ter_id &t );
+        void clear_original_ter( const point_sm_ms &p );
+
+        static constexpr size_t elements = SEEX * SEEY;
+};
+
+/**
+ * A wrapper for a submap point. Allows getting multiple map features
+ * (terrain, furniture etc.) without directly accessing submaps or
+ * doing multiple bounds checks and submap gets.
+ *
+ * Templated so that we can have const and non-const version; aliases in
+ * maptile_fwd.h
+ */
+template<typename Submap>
+class maptile_impl
+{
+        static_assert( std::is_same_v<std::remove_const_t<Submap>, submap>,
+                       "Submap should be either submap or const submap" );
+    private:
+        friend map; // To allow "sliding" the tile in x/y without bounds checks
+        friend submap;
+        Submap *sm;
+        point_sm_ms pos_;
+
+        maptile_impl( Submap *sub, const point_sm_ms &p ) :
+            sm( sub ), pos_( p ) { }
+        template<typename OtherSubmap>
+        // NOLINTNEXTLINE(google-explicit-constructor)
+        maptile_impl( const maptile_impl<OtherSubmap> &other ) :
+            sm( other.wrapped_submap() ), pos_( other.pos() ) { }
+    public:
+        Submap *wrapped_submap() const {
+            return sm;
+        }
+        inline point_sm_ms pos() const {
+            return pos_;
+        }
+
+        trap_id get_trap() const {
+            return sm->get_trap( pos() );
+        }
+
+        furn_id get_furn() const {
+            return sm->get_furn( pos() );
+        }
+
+        ter_id get_ter() const {
+            return sm->get_ter( pos() );
+        }
+
+        const trap &get_trap_t() const {
+            return sm->get_trap( pos() ).obj();
+        }
+
+        const furn_t &get_furn_t() const {
+            return sm->get_furn( pos() ).obj();
+        }
+        const ter_t &get_ter_t() const {
+            return sm->get_ter( pos() ).obj();
+        }
+
+        const field &get_field() const {
+            return sm->get_field( pos() );
+        }
+
+        using FieldEntry = cata::copy_const<Submap, field_entry>;
+        FieldEntry *find_field( const field_type_id &field_to_find ) {
+            return sm->get_field( pos() ).find_field( field_to_find );
+        }
+
+        int get_radiation() const {
+            return sm->get_radiation( pos() );
+        }
+
+        bool has_graffiti() const {
+            return sm->has_graffiti( pos() );
+        }
+
+        const std::string &get_graffiti() const {
+            return sm->get_graffiti( pos() );
+        }
+
+        bool has_signage() const {
+            return sm->has_signage( pos() );
+        }
+
+        std::string get_signage() const {
+            return sm->get_signage( pos() );
+        }
+
+        // For map::draw_maptile
+        size_t get_item_count() const {
+            return sm->get_items( pos() ).size();
+        }
+
+        // Assumes there is at least one item
+        const item &get_uppermost_item() const {
+            return *std::prev( sm->get_items( pos() ).cend() );
+        }
+
+        // Gets all items
+        const cata::colony<item> &get_items() const {
+            return sm->get_items( pos() );
+        }
+};
+
+#endif // CATA_SRC_SUBMAP_H

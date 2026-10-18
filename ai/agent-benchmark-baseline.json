@@ -1,0 +1,96 @@
+{
+  "case_count": 9,
+  "cases": [
+    {
+      "errors": [],
+      "estimated_tokens": 2957,
+      "id": "repository-navigation",
+      "passed": true,
+      "selected_routes": [
+        "repository-navigation"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 2762,
+      "id": "cpp-bug",
+      "passed": true,
+      "selected_routes": [
+        "cpp-bug"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 2445,
+      "id": "json-content",
+      "passed": true,
+      "selected_routes": [
+        "json-content"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 2773,
+      "id": "eoc",
+      "passed": true,
+      "selected_routes": [
+        "eoc"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 3307,
+      "id": "lua-api",
+      "passed": true,
+      "selected_routes": [
+        "lua-api"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 3503,
+      "id": "upstream-port",
+      "passed": true,
+      "selected_routes": [
+        "upstream-port"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 2782,
+      "id": "save-compatibility",
+      "passed": true,
+      "selected_routes": [
+        "save-compatibility"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 2554,
+      "id": "generated-file-detection",
+      "passed": true,
+      "selected_routes": [
+        "generated-file-detection"
+      ]
+    },
+    {
+      "errors": [],
+      "estimated_tokens": 3226,
+      "id": "documentation-impact",
+      "passed": true,
+      "selected_routes": [
+        "documentation-impact"
+      ]
+    }
+  ],
+  "generated_by": "python3 tools/agent/benchmark_context_pack.py",
+  "metrics": {
+    "correct_path_hit_rate": 1.0,
+    "first_pass_validation": 1.0,
+    "hallucinated_commands": 0,
+    "hallucinated_paths": 0,
+    "unrelated_changes": 0,
+    "upstream_divergence_regressions": 0
+  },
+  "schema_version": 1
+}

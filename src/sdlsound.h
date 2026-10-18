@@ -1,0 +1,53 @@
+#pragma once
+#ifndef CATA_SRC_SDLSOUND_H
+#define CATA_SRC_SDLSOUND_H
+
+#include <string>
+#include <string_view>
+#if defined(SDL_SOUND)
+
+/**
+ * Attempt to initialize an audio device.  Returns false if initialization fails.
+ */
+bool init_sound();
+void initSDLAudioOnly();
+void shutdown_sound();
+void play_music( std::string_view playlist );
+void set_temporary_music( std::string_view playlist );
+void clear_temporary_music();
+void stop_music();
+void update_music_volume();
+void load_soundset();
+extern bool sound_init_success;
+
+namespace sfx
+{
+struct melee_sound_sequence;
+void queue_melee_sound( melee_sound_sequence sequence );
+// Main-thread presentation pump and world/audio lifetime cleanup.
+void process_melee_sounds();
+void clear_melee_sounds();
+}
+
+#else
+
+inline bool init_sound()
+{
+    return false;
+}
+inline void shutdown_sound() { }
+inline void play_music( std::string_view /*playlist*/ )
+{
+}
+inline void set_temporary_music( std::string_view /*playlist*/ )
+{
+}
+inline void clear_temporary_music()
+{
+}
+inline void update_music_volume() { }
+inline void load_soundset() { }
+
+#endif
+
+#endif // CATA_SRC_SDLSOUND_H
