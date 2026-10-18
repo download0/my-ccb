@@ -392,15 +392,15 @@ jobs:
           # committed placeholder. Catches both a failed Transifex pull
           # (placeholder-only artifact) and a failed/empty artifact download.
           count=$(find lang/po -maxdepth 1 -name '*.po' ! -name 'placeholder.po' | wc -l)
-          if [ "$count" -eq 0 ]; then
+          mo_count=$(find lang/mo -name '*.mo' 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ] && [ "$mo_count" -eq 0 ]; then
             if [ "$GITHUB_REF_NAME" = "master" ]; then
-              echo "::error::No real translations found in lang/po (placeholder only). Refusing to package an untranslated build."
-              exit 1
+              echo "::warning::No translations found (this fork keeps real .po out of git and has no TX_TOKEN); packaging an English-only build."
             else
               echo "::warning::No real translations found (TX_TOKEN missing?), building without translations."
             fi
           fi
-          echo "Found $count translation .po file(s)."
+          echo "Found $count translation .po file(s) and $mo_count precompiled .mo file(s)."
       - name: Fetch shader artifacts into build (SDL3)
         if: matrix.sdl3 == 1
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

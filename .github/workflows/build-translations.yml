@@ -119,8 +119,13 @@ jobs:
             fi
             echo "::warning::Translation artifact from master run $run_id is unavailable or incomplete"
           done
-          echo "::error::No downloadable translation artifact is available from recent trusted master builds"
-          exit 1
+          # Fork fallback: a personal fork usually has no TX_TOKEN and, on the
+          # first run, no earlier trusted master build to copy translations from.
+          # Continue with whatever translations are present in the checkout
+          # (real .po files, precompiled lang/mo, or none) instead of failing the
+          # whole build at the checkout/translation stage.
+          echo "::warning::No downloadable translation artifact from recent trusted master builds; continuing with the translations present in the checkout."
+          exit 0
 
       - name: Validate and discard invalid translations
         if: ${{ env.TX_TOKEN != '' }}
