@@ -52,7 +52,13 @@ if ($staged.Count -eq 0) {
 }
 
 mkdir bindist/lang
-cp -r lang/mo bindist/lang
+# lang/mo only exists when the checkout has compiled translations; this fork
+# ships none (no .po in the repo), so package without them instead of dying.
+if (Test-Path lang/mo) {
+	cp -r lang/mo bindist/lang
+} else {
+	Write-Warning 'lang/mo is absent from the checkout; packaging without compiled translations (English UI).'
+}
 
 $extras = "data", "doc", "gfx", "LICENSE.txt", "LICENSE-OFL-Terminus-Font.txt", "README.md", "VERSION.txt"
 ForEach ($extra in $extras) {
